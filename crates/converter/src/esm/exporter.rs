@@ -174,11 +174,26 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                 let cell_id = record.cell_form_id.unwrap_or(form_id);
                 tx.execute("INSERT OR REPLACE INTO land(cell_id, heightmap, vtex, vclr, normals) VALUES (?1, ?2, ?3, ?4, ?5)", params![cell_id, heightmap, vtex, vclr, normals])?;
             }
-            "STAT" | "MSTT" | "FURN" => {
+            // Every base record type with a world model. The runtime spawns
+            // anything that resolves a model path here, so trees, flora,
+            // containers, doors, activators, lights, and placed inventory all
+            // render; records without MODL (triggers, markers, most lights)
+            // store NULL and are skipped at spawn time.
+            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR"
+            | "ACTI" | "LIGH" | "WEAP" | "MISC" | "BOOK" | "AMMO" | "ALCH"
+            | "INGR" | "SLGM" | "KEYM" | "SCRL" | "ARMO" => {
                 let view = SubrecordView::new(&record.subrecords);
+                // ARMO has no MODL path; its world models live in the
+                // gendered MOD2/MOD3 slots (male first, female fallback).
+                let model = if type_str == "ARMO" {
+                    view.get_string(b"MOD2")
+                        .or_else(|| view.get_string(b"MOD3"))
+                } else {
+                    view.get_string(b"MODL")
+                };
                 tx.execute(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)",
-                    params![form_id, view.get_string(b"EDID"), view.get_string(b"MODL"), record.flags],
+                    params![form_id, view.get_string(b"EDID"), model, record.flags],
                 )?;
             }
             "NPC_" => {
@@ -395,6 +410,75 @@ mod tests {
         assert_eq!(
             water_flow_normal_path(&view).as_deref(),
             Some("water/riverflow.dds")
+        );
+    }
+
+    #[test]
+    fn exports_world_models_for_every_placeable_base_type() {
+        fn base(
+            form_id: u32,
+            record_type: &[u8; 4],
+            model_tag: &[u8; 4],
+            model: Option<&str>,
+        ) -> RawRecord {
+            let mut subrecords = vec![(b"EDID".to_vec(), b"TestBase\0".to_vec())];
+            if let Some(model) = model {
+                let mut path = model.as_bytes().to_vec();
+                path.push(0);
+                subrecords.push((model_tag.to_vec(), path));
+            }
+            RawRecord {
+                form_id,
+                record_type: *record_type,
+                flags: 0,
+                subrecords,
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 0,
+            }
+        }
+        let master: HashMap<u32, RawRecord> = [
+            base(1, b"TREE", b"MODL", Some("Landscape\\Trees\\Pine01.nif")),
+            base(2, b"FLOR", b"MODL", Some("Landscape\\Plants\\Thistle01.nif")),
+            base(3, b"CONT", b"MODL", Some("Furniture\\Chest01.nif")),
+            base(4, b"DOOR", b"MODL", Some("Architecture\\Door01.nif")),
+            base(5, b"ACTI", b"MODL", None),
+            base(6, b"LIGH", b"MODL", None),
+            base(7, b"WEAP", b"MODL", Some("Weapons\\Sword01.nif")),
+            base(8, b"ARMO", b"MOD2", Some("Armor\\Helmet01.nif")),
+            base(9, b"ARMO", b"MOD3", Some("Armor\\HelmetFemale01.nif")),
+            base(10, b"NPC_", b"MODL", None),
+            // ARMO carries a binary MODL chunk that is not a path; with no
+            // MOD2/MOD3 present the row must store NULL, not garbage.
+            base(11, b"ARMO", b"MODL", Some("G.\u{1}binary")),
+        ]
+        .into_iter()
+        .map(|record| (record.form_id, record))
+        .collect();
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        export_to_db(&conn, &master).unwrap();
+        let models: Vec<(u32, Option<String>)> = conn
+            .prepare("SELECT id, model_path FROM statics ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            models,
+            vec![
+                (1, Some("Landscape\\Trees\\Pine01.nif".to_owned())),
+                (2, Some("Landscape\\Plants\\Thistle01.nif".to_owned())),
+                (3, Some("Furniture\\Chest01.nif".to_owned())),
+                (4, Some("Architecture\\Door01.nif".to_owned())),
+                (5, None),
+                (6, None),
+                (7, Some("Weapons\\Sword01.nif".to_owned())),
+                (8, Some("Armor\\Helmet01.nif".to_owned())),
+                (9, Some("Armor\\HelmetFemale01.nif".to_owned())),
+                (11, None),
+            ]
         );
     }
 

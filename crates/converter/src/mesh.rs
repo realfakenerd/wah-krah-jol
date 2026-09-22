@@ -1,5 +1,6 @@
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
+    NifAlphaMode, NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract,
+    publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -79,6 +80,7 @@ impl MeshConverter {
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
+        normalize_cutout_vertex_alpha(&mut model, &nif, &material_contract)?;
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
@@ -107,6 +109,7 @@ impl MeshConverter {
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             static_model.scene_root_rotation =
                 Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+            normalize_cutout_vertex_alpha(&mut static_model, &nif, &material_contract)?;
             ensure!(
                 !static_model.static_meshes.is_empty(),
                 "NIF contains no supported mesh geometry"
@@ -555,6 +558,53 @@ fn exported_shape_blocks(
         contract.len()
     );
     Ok(blocks)
+}
+
+/// Forces vertex-color alpha to opaque on alpha-tested (Cutout) shapes.
+///
+/// Bethesda stores edge fade in vertex alpha on foliage cards. The runtime
+/// multiplies vertex alpha into the alpha test, so minified distant texels
+/// fall below the authored cutoff and whole forests discard to sky. The
+/// cutout decision must come from the texture alpha alone.
+fn normalize_cutout_vertex_alpha(
+    model: &mut project_wormhole_nif::model::all::Model,
+    nif: &NifFile,
+    contract: &[NifShapeMaterial],
+) -> Result<()> {
+    let blocks = exported_shape_blocks(nif, model, contract)?;
+    let static_count = model.static_meshes.len();
+    for (mesh_index, block) in blocks.iter().enumerate() {
+        let shape = contract
+            .iter()
+            .find(|shape| shape.shape_block == *block)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "exported mesh references shape block {block} without a material contract"
+                )
+            })?;
+        let cutout = matches!(
+            &shape.disposition,
+            NifMaterialDisposition::Validated { material }
+                if material.alpha_mode == NifAlphaMode::Cutout
+        );
+        if !cutout {
+            continue;
+        }
+        if mesh_index < static_count {
+            for color in &mut model.static_meshes[mesh_index].colors {
+                color.0.w = 1.0;
+            }
+        } else if let Some(inner) = model
+            .skeletal_meshes
+            .get_mut(mesh_index - static_count)
+            .and_then(|mesh| mesh.mesh.as_mut())
+        {
+            for color in &mut inner.colors {
+                color.0.w = 1.0;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_nif_resilient(
@@ -1827,5 +1877,120 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&glb).unwrap(), before);
+    }
+
+    #[test]
+    fn cutout_shapes_get_opaque_vertex_alpha() {
+        use crate::material::{LightingShaderType, NifShaderFamily, ValidatedNifMaterial};
+        use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
+        use project_wormhole_shared::glam::{Mat3, Vec3, Vec4};
+        use project_wormhole_shared::prelude::BSVec4;
+
+        fn node(block_index: u32, mesh: usize) -> StaticSceneNode {
+            StaticSceneNode {
+                block_index,
+                name: None,
+                translation: Vec3::ZERO,
+                rotation: Mat3::IDENTITY,
+                scale: 1.0,
+                children: Vec::new(),
+                mesh: Some(mesh),
+            }
+        }
+
+        fn shape(block: u32, alpha_mode: NifAlphaMode) -> NifShapeMaterial {
+            NifShapeMaterial {
+                shape_block: block,
+                shape_name: None,
+                shader_property_block: None,
+                alpha_property_block: None,
+                disposition: NifMaterialDisposition::Validated {
+                    material: ValidatedNifMaterial {
+                        shader_family: NifShaderFamily::Lighting,
+                        lighting_shader_type: Some(LightingShaderType::Default),
+                        shader_block: 0,
+                        texture_set_block: None,
+                        alpha_property_block: None,
+                        shader_flags_1: 0,
+                        shader_flags_2: 0,
+                        base_color: [1.0, 1.0, 1.0, 1.0],
+                        alpha: 1.0,
+                        alpha_mode,
+                        alpha_threshold: Some(112),
+                        glossiness: 0.0,
+                        specular_color: [0.0, 0.0, 0.0],
+                        specular_strength: 0.0,
+                        emissive_color: [0.0, 0.0, 0.0],
+                        emissive_multiple: 1.0,
+                        double_sided: true,
+                        textures: Vec::new(),
+                    },
+                },
+            }
+        }
+
+        let mut model = Model {
+            name: None,
+            static_meshes: vec![
+                StaticMesh {
+                    colors: vec![
+                        BSVec4(Vec4::new(1.0, 0.5, 0.25, 0.0)),
+                        BSVec4(Vec4::new(0.0, 1.0, 0.5, 0.44)),
+                    ],
+                    ..StaticMesh::default()
+                },
+                StaticMesh {
+                    colors: vec![BSVec4(Vec4::new(1.0, 1.0, 1.0, 0.0))],
+                    ..StaticMesh::default()
+                },
+            ],
+            static_nodes: vec![node(7, 0), node(9, 1)],
+            skeletal_meshes: Vec::new(),
+            materials: Vec::new(),
+            material_indices: Vec::new(),
+            scene_root_rotation: None,
+        };
+        let nif = NifFile {
+            header: NifHeader {
+                file_desc: StringN {
+                    value: String::new(),
+                },
+                nif_version: NifFileVersion(0),
+                endian_type: Endianess::Little,
+                user_version: 0,
+                block_count: 0,
+                bethesda_version: 0,
+                author: None,
+                process_script: None,
+                export_script: None,
+                max_filepath: None,
+                block_types: Vec::new(),
+                block_type_index: Vec::new(),
+                block_size_index: Vec::new(),
+                string_count: 0,
+                string_max_size: 0,
+                strings: Vec::new(),
+                groups: Vec::new(),
+            },
+            blocks: Vec::new(),
+        };
+        let contract = vec![
+            shape(7, NifAlphaMode::Cutout),
+            shape(9, NifAlphaMode::Opaque),
+        ];
+
+        normalize_cutout_vertex_alpha(&mut model, &nif, &contract).unwrap();
+
+        let cutout = &model.static_meshes[0].colors;
+        assert_eq!(cutout.len(), 2);
+        for color in cutout {
+            assert_eq!(color.0.w, 1.0);
+        }
+        assert_eq!(cutout[0].0.x, 1.0);
+        assert_eq!(cutout[0].0.y, 0.5);
+        assert_eq!(cutout[0].0.z, 0.25);
+        let opaque = &model.static_meshes[1].colors;
+        assert_eq!(opaque.len(), 1);
+        assert_eq!(opaque[0].0.w, 0.0);
     }
 }

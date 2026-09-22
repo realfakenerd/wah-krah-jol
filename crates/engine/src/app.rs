@@ -22,6 +22,7 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    pbr::{DistanceFog, FogFalloff},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
@@ -1215,7 +1216,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    14
+    15
 }
 
 fn setup_synthetic_benchmark(
@@ -1261,22 +1262,41 @@ fn setup_world(
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
     let camera_offset = if config.acceptance_screenshot.is_some() {
-        Vec3::new(0.0, 20_000.0, 1000.0)
+        config
+            .screenshot_camera_offset
+            .map(Vec3::from)
+            .unwrap_or(Vec3::new(0.0, 20_000.0, 1000.0))
     } else {
         Vec3::new(0.0, 1200.0, 2500.0)
     };
     let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
-    commands.spawn((
-        Camera3d::default(),
-        Projection::Perspective(PerspectiveProjection { far, ..default() }),
-        Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
-        StreamingCamera,
-        Msaa::Off,
-        DepthPrepass,
-        OcclusionCulling,
-        RenderLayers::from_layers(&[0, 1]),
-    ));
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection { far, ..default() }),
+            Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
+            StreamingCamera,
+            Msaa::Off,
+            DepthPrepass,
+            OcclusionCulling,
+            RenderLayers::from_layers(&[0, 1]),
+        ))
+        .id();
+    if config.acceptance_screenshot.is_some() {
+        // Beauty path only: sky backdrop plus distance haze so streamed
+        // terrain melts into the horizon instead of ending at a void edge.
+        let sky = Color::srgb(0.6, 0.73, 0.9);
+        commands.insert_resource(ClearColor(sky));
+        commands.entity(camera).insert(DistanceFog {
+            color: sky,
+            falloff: FogFalloff::Linear {
+                start: far * 0.55,
+                end: far * 1.05,
+            },
+            ..default()
+        });
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
@@ -1443,6 +1463,8 @@ fn capture_acceptance_screenshot(
     let assets_ready = streaming.as_deref().is_none_or(|metrics| {
         metrics.pending_asset_instances == 0
             && metrics.pending_surface_instances == 0
+            && metrics.loading_cells == 0
+            && metrics.resident_cells > 0
             && metrics.asset_load_failures == 0
             && metrics.material_validation_failures == 0
             && metrics.transform_bounds_validation_failures == 0

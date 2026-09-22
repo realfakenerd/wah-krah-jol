@@ -125,11 +125,10 @@ impl AssetCatalog {
 }
 
 fn converted_texture_path(path: String) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let without_prefix = normalized
-        .strip_prefix("textures/")
-        .or_else(|| normalized.strip_prefix("Textures/"))
-        .unwrap_or(&normalized);
+    // Converted assets are published with lowercase canonical paths, so the
+    // lookup must lowercase too (matching world-inspect's resolver).
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let without_prefix = normalized.strip_prefix("textures/").unwrap_or(&normalized);
     if without_prefix.is_empty() {
         return None;
     }
@@ -382,14 +381,14 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/grass.dds'); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO waters VALUES(9,'textures/water/flow.dds');",
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'Textures\\Landscape\\Tundra02.DDS'); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO waters VALUES(9,'textures/water/flow.dds');",
             )
             .unwrap();
         drop(connection);
         let catalog = AssetCatalog::open(&path).unwrap();
         assert_eq!(
             catalog.landscape_diffuse(1),
-            Some("textures/land/grass.ktx2")
+            Some("textures/landscape/tundra02.ktx2")
         );
         assert_eq!(catalog.water_flow(9), Some("textures/water/flow.ktx2"));
     }
