@@ -1957,7 +1957,8 @@ mod tests {
     #[test]
     fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
         let mut app = App::new();
-        app.insert_resource(RenderOrigin(IVec2::ZERO))
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
