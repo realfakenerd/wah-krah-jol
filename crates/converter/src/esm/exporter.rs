@@ -179,9 +179,9 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
             // containers, doors, activators, lights, and placed inventory all
             // render; records without MODL (triggers, markers, most lights)
             // store NULL and are skipped at spawn time.
-            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR"
-            | "ACTI" | "LIGH" | "WEAP" | "MISC" | "BOOK" | "AMMO" | "ALCH"
-            | "INGR" | "SLGM" | "KEYM" | "SCRL" | "ARMO" => {
+            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR" | "ACTI" | "LIGH"
+            | "WEAP" | "MISC" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL"
+            | "ARMO" => {
                 let view = SubrecordView::new(&record.subrecords);
                 // ARMO has no MODL path; its world models live in the
                 // gendered MOD2/MOD3 slots (male first, female fallback).
@@ -439,7 +439,12 @@ mod tests {
         }
         let master: HashMap<u32, RawRecord> = [
             base(1, b"TREE", b"MODL", Some("Landscape\\Trees\\Pine01.nif")),
-            base(2, b"FLOR", b"MODL", Some("Landscape\\Plants\\Thistle01.nif")),
+            base(
+                2,
+                b"FLOR",
+                b"MODL",
+                Some("Landscape\\Plants\\Thistle01.nif"),
+            ),
             base(3, b"CONT", b"MODL", Some("Furniture\\Chest01.nif")),
             base(4, b"DOOR", b"MODL", Some("Architecture\\Door01.nif")),
             base(5, b"ACTI", b"MODL", None),

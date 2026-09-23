@@ -254,9 +254,8 @@ mod tests {
             config.screenshot_camera_offset,
             Some((0.0, 6000.0, 12000.0))
         );
-        let config = EngineConfig::from_args(
-            ["--screenshot-camera-offset", "0,6000"].map(str::to_owned),
-        );
+        let config =
+            EngineConfig::from_args(["--screenshot-camera-offset", "0,6000"].map(str::to_owned));
         assert_eq!(config.screenshot_camera_offset, None);
         assert_eq!(EngineConfig::default().screenshot_camera_offset, None);
     }

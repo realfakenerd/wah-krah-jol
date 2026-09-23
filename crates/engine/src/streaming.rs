@@ -1908,10 +1908,8 @@ mod tests {
             Some("meshes/architecture/wall.glb")
         );
         assert_eq!(
-            converted_model_path(
-                "Meshes\\Landscape\\Tundra\\TundraStreamStraight01.NIF".into()
-            )
-            .as_deref(),
+            converted_model_path("Meshes\\Landscape\\Tundra\\TundraStreamStraight01.NIF".into())
+                .as_deref(),
             Some("meshes/landscape/tundra/tundrastreamstraight01.glb")
         );
         assert_eq!(
