@@ -1,6 +1,5 @@
-# Uncomment to use kache for ultra-fast incremental rebuilds
-# [build]
-# rustc-wrapper = "kache"
+# Local kache use is opt-in via RUSTC_WRAPPER=kache (see README).
+# CI enables kache through kunobi-ninja/kache-action@v1.
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"

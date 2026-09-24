@@ -93,6 +93,20 @@ Wah Krah Jol is being built systematically across 5 core phases. Explore the ful
    cargo run -p launcher
    ```
 
+### Faster rebuilds with kache
+
+This repo uses [kache](https://kunobi.ninja/docs/kache) in CI, and it also
+speeds up local builds and git worktrees by sharing compiled dependencies:
+
+```bash
+cargo install kache
+export RUSTC_WRAPPER=kache  # add to your shell profile to keep it
+```
+
+kache is opt-in locally: unset `RUSTC_WRAPPER` for a plain Cargo build.
+Each worktree keeps its own `target/` directory; do not share one
+`CARGO_TARGET_DIR` across worktrees.
+
 ---
 
 ## 📚 Technical Specifications (`docs/specs/`)
