@@ -83,7 +83,12 @@ Height/detail, environment, environment-mask, inner-layer and greyscale slots re
 `OPEN_SKYRIM_material` extension because core glTF has no equivalent Skyrim shader semantics.
 The extension also records premultiplied-alpha and screen-door-alpha requirements. Texture URIs
 always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2 encoding itself is closed by
-the following conversion stage.
+the following conversion stage. Once that stage has published the hierarchy, the pipeline prunes
+from every GLB the texture URIs whose source texture is absent from the installed game data -
+including a base-color URI - together with every core or `OPEN_SKYRIM_material` slot that referenced
+them, so a NIF naming a texture Bethesda never shipped still publishes and renders with its
+remaining maps. The dropped paths are recorded per mesh under `pruned_texture_references` in
+`conversion-manifest.json` and do not make the conversion incomplete.
 
 ---
 

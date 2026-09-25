@@ -20,7 +20,7 @@
 
 ## Implementation status
 
-The Phase 1 implementation is integrated in `crates/converter` and consumed by the launcher. A run is considered successful only when every discovered supported input is converted, every generated artifact passes structural validation, and `conversion-manifest.json` is published with `complete: true`.
+The Phase 1 implementation is integrated in `crates/converter` and consumed by the launcher. A run is considered successful only when every discovered supported input is converted, every generated artifact passes structural validation, and `conversion-manifest.json` is published with `complete: true`. A texture reference whose source is absent from the installed game data is not a conversion failure: the converter publishes the mesh without that reference and records the dropped path under the mesh's `pruned_texture_references`. That record is an audit trail for whoever inspects a published asset set: the launcher, the acceptance preflight and the engine accept the set on `complete` plus the converter schema version, and none of them reads the pruned reference list.
 
 The integration report distinguishes conversion-closure failures from references to source assets that are absent from the installed game data. Missing converted artifacts remain fatal when their source exists. Undistributed ESM references and converted animated/effect GLBs without static bounds are reported as coverage metrics, but do not make an otherwise complete asset conversion fail.
 

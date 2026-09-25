@@ -96,6 +96,12 @@ async fn main() -> Result<()> {
         "Converted {}, reused {}, skipped {} in {} ms (complete: {})",
         report.converted, report.cache_hits, report.skipped, report.elapsed_ms, report.complete
     );
+    if report.pruned_texture_references > 0 {
+        println!(
+            "Published meshes omit {} texture reference(s) the game data does not contain; conversion-manifest.json records them under pruned_texture_references",
+            report.pruned_texture_references
+        );
+    }
     if !report.complete {
         bail!(
             "conversion produced {} warning(s) and {} skipped input(s); see conversion-manifest.json",

@@ -39,7 +39,13 @@ output is atomically renamed into place, the converter verifies:
 - expanded RGBA byte size, color model and supercompression mode.
 
 Temporary files are removed after a failed validation/publication. Batch conversion is staged and
-only becomes a complete schema-12 manifest when every asset and required GLB texture URI validates.
+only becomes a complete conversion manifest when every supported input converts and every generated
+artifact validates. A texture the installed game data contains but the converter cannot publish
+still fails the run; a texture reference whose source the game data does not contain does not. The
+converter drops those references - including a base-color URI - and every material slot that pointed
+at them from the published GLB, records the dropped path under that mesh's
+`pruned_texture_references` entry in `conversion-manifest.json`, and still publishes the manifest
+with `complete: true`, so the mesh renders with the maps that do exist.
 The standalone texture-closure report uses format version 3, records the converter schema and the
 same metadata per texture, and never reports success for missing required assets or conversion
 failures.

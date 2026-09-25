@@ -41,11 +41,27 @@ pub struct PipelineReport {
     pub converted: u64,
     pub cache_hits: u64,
     pub skipped: u64,
+    /// Dangling texture references the published meshes omit because the game
+    /// data does not contain those textures: references this run pruned plus the
+    /// records it carried forward for meshes it reused. Matches the
+    /// `pruned_texture_references` map published in the manifest. Counted
+    /// separately from `skipped` and `warnings`: nothing failed to convert, so a
+    /// prune never makes the run incomplete.
+    pub pruned_texture_references: u64,
     pub warnings: Vec<String>,
     pub artifacts: Vec<PathBuf>,
     pub inputs_by_kind: BTreeMap<String, u64>,
     pub elapsed_ms: u128,
     pub integration: Option<IntegrationReport>,
+}
+
+/// A run is complete when nothing was skipped and nothing warned. Pruned dangling
+/// texture references are deliberately absent: the game data does not contain those
+/// textures, so dropping the reference is a fact about the source, not a failure to
+/// convert. A failed archive, a mesh that will not convert or a failed integration
+/// still skip or warn, so they still land here.
+fn conversion_is_complete(report: &PipelineReport) -> bool {
+    report.skipped == 0 && report.warnings.is_empty()
 }
 
 pub struct AssetPipeline;
@@ -136,6 +152,7 @@ impl AssetPipeline {
             configuration_hash: configuration_hash(config)?,
             inputs_by_kind: Default::default(),
             failures: Default::default(),
+            pruned_texture_references: Default::default(),
             archives: Default::default(),
             entries: Default::default(),
         };
@@ -307,27 +324,55 @@ impl AssetPipeline {
                         "warning: pruned dangling texture {uri} referenced by {} (no converted artifact)",
                         file.glb
                     );
-                    let key = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
+                    let reference = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
                         .ok()
                         .and_then(|resolved| {
                             resolved.strip_prefix(staging).ok().map(Path::to_path_buf)
                         })
                         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_else(|| uri.clone());
-                    batch
-                        .record_skip(
+                    if batch.record_pruned_texture_reference(&file.glb, &reference) {
+                        send(
+                            batch.progress_tx,
                             ProgressStage::Textures,
                             pruned_completed,
                             pruned_uris,
-                            key,
-                            PathBuf::from(&file.glb),
-                            color_eyre::eyre::eyre!(
-                                "texture {uri} has no converted artifact; reference pruned"
-                            ),
+                            Some(PathBuf::from(&file.glb)),
+                            "Texture reference pruned",
                         )
                         .await;
+                    }
                 }
             }
+            // A mesh this run left alone keeps the prune record of the run that
+            // wrote it: those references are no longer in the file, so the pass
+            // above cannot report them again. The published copy decides whether
+            // that record still describes the mesh about to be published.
+            for (glb, references) in &previous.pruned_texture_references {
+                if batch
+                    .manifest
+                    .pruned_texture_references
+                    .contains_key(glb.as_str())
+                {
+                    continue;
+                }
+                let published = config.output_dir.join(glb);
+                if !files_are_identical(&staging.join(glb), &published) {
+                    continue;
+                }
+                for reference in references {
+                    batch.record_pruned_texture_reference(glb, reference);
+                }
+            }
+            // The run summary reports what the manifest records, whether this run
+            // pruned it or carried the record forward for a reused mesh.
+            let recorded: u64 = batch
+                .manifest
+                .pruned_texture_references
+                .values()
+                .map(|references| references.len() as u64)
+                .sum();
+            batch.report.pruned_texture_references = recorded;
             batch
                 .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
                 .await?;
@@ -378,7 +423,7 @@ impl AssetPipeline {
             "Generated artifacts are valid",
         )
         .await;
-        manifest.complete = report.skipped == 0 && report.warnings.is_empty();
+        manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
         report.inputs_by_kind = manifest.inputs_by_kind.clone();
         manifest.save(&staging.join("conversion-manifest.json"))?;
@@ -757,6 +802,22 @@ impl ConversionBatch<'_> {
         self.report.warnings.push(message);
         self.report.skipped += 1;
     }
+
+    /// Records a texture reference a published mesh omits because the game data
+    /// does not contain that texture, whether this run pruned it or an earlier
+    /// run did and the mesh was reused. Returns whether the reference is new, so
+    /// the caller reports progress only for work this run performed.
+    ///
+    /// A prune is loud like a skip - the progress stream and the run summary name
+    /// the mesh - but it is not a skip: no warning is recorded and nothing lands
+    /// in `manifest.failures`, so the conversion stays complete.
+    fn record_pruned_texture_reference(&mut self, glb: &str, reference: &str) -> bool {
+        self.manifest
+            .pruned_texture_references
+            .entry(glb.to_owned())
+            .or_default()
+            .insert(reference.to_owned())
+    }
 }
 
 fn collect_texture_semantics(
@@ -905,6 +966,22 @@ fn discover(root: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
     Ok(files)
+}
+
+/// Whether two paths hold byte-identical files. Used to decide whether a prune
+/// record from an earlier manifest still describes the mesh about to be
+/// published, so a record is never repeated for a mesh that changed.
+fn files_are_identical(left: &Path, right: &Path) -> bool {
+    let (Ok(left_metadata), Ok(right_metadata)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    if left_metadata.len() != right_metadata.len() {
+        return false;
+    }
+    match (hash_file(left), hash_file(right)) {
+        (Ok(left_hash), Ok(right_hash)) => left_hash == right_hash,
+        _ => false,
+    }
 }
 
 fn validate_artifacts(
@@ -1344,11 +1421,329 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pruned_texture_references_do_not_make_a_run_incomplete() {
+        let pruned_only = PipelineReport {
+            pruned_texture_references: 182,
+            ..PipelineReport::default()
+        };
+        assert!(
+            conversion_is_complete(&pruned_only),
+            "a texture the game data never contained must not block a release"
+        );
+
+        let skipped = PipelineReport {
+            skipped: 1,
+            ..PipelineReport::default()
+        };
+        assert!(!conversion_is_complete(&skipped));
+
+        let warned = PipelineReport {
+            warnings: vec!["asset integration failed: 1 missing models".to_owned()],
+            ..PipelineReport::default()
+        };
+        assert!(!conversion_is_complete(&warned));
+    }
+
+    #[tokio::test]
+    async fn publishes_meshes_with_missing_textures_and_stays_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("meshes")).unwrap();
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
+        // One mesh drops an auxiliary map, the other the mandatory base color.
+        let shapes = [
+            (
+                "meshes/missing_normal.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingNormalQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/present.dds",
+                    normal_texture: "textures/absent_n.dds",
+                },
+            ),
+            (
+                "meshes/missing_diffuse.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingDiffuseQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/absent.dds",
+                    normal_texture: "textures/present_n.dds",
+                },
+            ),
+        ];
+        for (path, shape) in shapes {
+            fs::write(
+                data.join(path),
+                dummy_content::nif::static_shape(&shape).unwrap(),
+            )
+            .unwrap();
+        }
+        for texture in ["textures/present.dds", "textures/present_n.dds"] {
+            fs::write(
+                data.join(texture),
+                dummy_content::dds::generate(
+                    &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                    &mut dummy_content::rng::Rng::new(7),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            report.complete,
+            "a texture the game data does not contain is not an incomplete conversion"
+        );
+        assert_eq!(report.pruned_texture_references, 2);
+
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(manifest.complete);
+        assert!(
+            manifest.failures.is_empty(),
+            "a pruned reference is not a failure: {:?}",
+            manifest.failures
+        );
+        // Base color is published through an sRGB alias, so that is the URI the
+        // mesh dropped.
+        assert_eq!(
+            manifest
+                .pruned_texture_references
+                .get("meshes/missing_diffuse.glb"),
+            Some(&BTreeSet::from([
+                "textures/absent.opensky-srgb.ktx2".to_owned()
+            ]))
+        );
+        assert_eq!(
+            manifest
+                .pruned_texture_references
+                .get("meshes/missing_normal.glb"),
+            Some(&BTreeSet::from(["textures/absent_n.ktx2".to_owned()]))
+        );
+        for (glb, kept) in [
+            ("meshes/missing_diffuse.glb", "present_n"),
+            ("meshes/missing_normal.glb", "present.opensky-srgb"),
+        ] {
+            let uris = MeshConverter::glb_texture_uris(&output.join(glb)).unwrap();
+            assert!(
+                !uris.iter().any(|uri| uri.contains("absent")),
+                "the dangling reference is still in {glb}: {uris:?}"
+            );
+            assert!(
+                uris.iter().any(|uri| uri.contains(kept)),
+                "{glb} lost the texture that does exist: {uris:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_archives_still_skip_and_warn() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("broken.bsa"), b"not a BSA archive").unwrap();
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("broken.bsa"));
+        assert_eq!(report.pruned_texture_references, 0);
+        assert!(!report.complete);
+
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(!manifest.complete);
+        assert_eq!(manifest.failures.len(), 1);
+        assert!(manifest.pruned_texture_references.is_empty());
+    }
+
+    const PRUNED_MESH: &str = "meshes/dangling_normal.glb";
+    const PRUNED_REFERENCE: &str = "textures/absent_n.ktx2";
+
+    /// Writes one NIF whose normal map is absent from the game data, next to the
+    /// base-color DDS the game data does contain.
+    fn write_mesh_with_absent_normal(data: &Path) {
+        fs::create_dir_all(data.join("meshes")).unwrap();
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
+        let shape = dummy_content::nif::StaticShape {
+            name: "DanglingNormalQuad",
+            positions: &positions,
+            normals: &normals,
+            uvs: &uvs,
+            indices: &indices,
+            diffuse: "textures/present.dds",
+            normal_texture: "textures/absent_n.dds",
+        };
+        fs::write(
+            data.join("meshes/dangling_normal.nif"),
+            dummy_content::nif::static_shape(&shape).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("textures/present.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(7),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_runs_carry_reused_mesh_prunes_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()]))
+        );
+
+        // Resume from a staging directory holding exactly what the first run
+        // published: the mesh is reused instead of converted again, so the prune
+        // pass has nothing left to remove from it.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let (resumed, events) = run_collecting_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message == "Texture reference pruned")
+                .count(),
+            0,
+            "the resumed run reused the pruned mesh instead of pruning it again"
+        );
+        assert_eq!(
+            resumed.pruned_texture_references, 1,
+            "the prune record of the reused mesh is carried forward"
+        );
+        let manifest = published_manifest(&output);
+        assert!(manifest.complete);
+        assert_eq!(
+            manifest.pruned_texture_references.get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()]))
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(
+            !uris.iter().any(|uri| uri.contains("absent")),
+            "the record describes the published mesh: {uris:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_meshes_do_not_keep_stale_prune_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        // Another build republished the mesh: the stored record no longer
+        // describes the bytes that would be published again.
+        let mut rebuilt = fs::read(output.join(PRUNED_MESH)).unwrap();
+        rebuilt.push(0);
+        fs::write(output.join(PRUNED_MESH), rebuilt).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(resumed.pruned_texture_references, 0);
+        assert!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .is_empty()
+        );
+    }
+
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
         let (tx, mut rx) = mpsc::channel(64);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let report = AssetPipeline::run_async(config, tx).await.unwrap();
         drain.await.unwrap();
         report
+    }
+
+    /// Runs the pipeline and returns its report together with every progress
+    /// event it emitted.
+    async fn run_collecting_progress(
+        config: PipelineConfig,
+    ) -> (PipelineReport, Vec<ProgressEvent>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let report = AssetPipeline::run_async(config, tx).await.unwrap();
+        (report, collect.await.unwrap())
+    }
+
+    /// Loads the manifest published in an output directory.
+    fn published_manifest(output: &Path) -> ConversionManifest {
+        ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap()
+    }
+
+    /// Copies a published asset tree into a staging directory, so a run can
+    /// resume from it.
+    fn copy_tree(source: &Path, destination: &Path) {
+        for entry in WalkDir::new(source) {
+            let entry = entry.unwrap();
+            let relative = entry.path().strip_prefix(source).unwrap();
+            let target = destination.join(relative);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
     }
 }
