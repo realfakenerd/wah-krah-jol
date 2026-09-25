@@ -2,8 +2,8 @@ use crate::{
     archive::ArchiveExtractor,
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
-        CacheEntry, ConversionManifest, configuration_hash, configuration_hash_for_schema,
-        hash_file,
+        CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, StagedOutput, StagingJournal,
+        configuration_hash, configuration_hash_for_schema, hash_file, load_staged_outputs,
     },
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
@@ -107,7 +107,43 @@ impl AssetPipeline {
             "Publishing converted assets",
         )
         .await;
-        publish_directory(&staging, &config.output_dir)?;
+        // The journal is bookkeeping for a resume, not an asset, and a
+        // published directory can never be resumed: the published manifest
+        // records the same provenance. It is moved beside the staging
+        // directory before the rename, so the published directory never holds
+        // it, and moved back if publishing fails so staging stays resumable.
+        let journal = StagingJournal::path_in(&staging);
+        let parked = parked_journal_path(&staging);
+        let journal_parked = journal.is_file();
+        if journal_parked {
+            fs::rename(&journal, &parked).wrap_err_with(|| {
+                format!("failed to move the staging journal to {}", parked.display())
+            })?;
+        }
+        if let Err(error) = publish_directory(&staging, &config.output_dir) {
+            if journal_parked {
+                // Staging is gone only when the rename itself succeeded and a
+                // later cleanup failed; the journal then has nothing to resume.
+                let restored = if staging.is_dir() {
+                    fs::rename(&parked, &journal)
+                } else {
+                    fs::remove_file(&parked)
+                };
+                if let Err(restore_error) = restored {
+                    eprintln!(
+                        "warning: failed to put back the staging journal {}: {restore_error}",
+                        parked.display()
+                    );
+                }
+            }
+            return Err(error);
+        }
+        if journal_parked && let Err(error) = fs::remove_file(&parked) {
+            eprintln!(
+                "warning: failed to remove the staging journal {}: {error}",
+                parked.display()
+            );
+        }
         report.elapsed_ms = started.elapsed().as_millis();
         if report.complete {
             send(
@@ -130,10 +166,26 @@ impl AssetPipeline {
         progress_tx: &Sender<ProgressEvent>,
     ) -> Result<PipelineReport> {
         let mut report = PipelineReport::default();
+        let expected_configuration = configuration_hash(config)?;
+        // Provenance of the outputs already in `staging`, written by the run
+        // that was interrupted. Invalidation drops it along with the published
+        // manifest, so with `--invalidate-cache` every output is converted
+        // again.
+        let staged_outputs = Arc::new(if config.invalidate_cache {
+            BTreeMap::new()
+        } else {
+            load_staged_outputs(staging).wrap_err_with(|| {
+                format!(
+                    "failed to read the staging journal in {}",
+                    staging.display()
+                )
+            })?
+        });
+        let mut journal = StagingJournal::open(staging)?;
         let mut manifest = ConversionManifest {
-            schema_version: crate::cache::CONVERTER_SCHEMA_VERSION,
+            schema_version: CONVERTER_SCHEMA_VERSION,
             complete: false,
-            configuration_hash: configuration_hash(config)?,
+            configuration_hash: expected_configuration.clone(),
             inputs_by_kind: Default::default(),
             failures: Default::default(),
             archives: Default::default(),
@@ -263,6 +315,9 @@ impl AssetPipeline {
                 config,
                 staging,
                 previous,
+                staged: Arc::clone(&staged_outputs),
+                expected_configuration: &expected_configuration,
+                journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
                 progress_tx,
@@ -277,6 +332,9 @@ impl AssetPipeline {
                 config,
                 staging,
                 previous,
+                staged: Arc::clone(&staged_outputs),
+                expected_configuration: &expected_configuration,
+                journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
                 progress_tx,
@@ -393,6 +451,11 @@ struct ConversionBatch<'a> {
     config: &'a PipelineConfig,
     staging: &'a Path,
     previous: &'a ConversionManifest,
+    /// Provenance of the outputs already in `staging`, keyed by canonical
+    /// source key; empty when the cache is invalidated.
+    staged: Arc<BTreeMap<String, StagedOutput>>,
+    expected_configuration: &'a str,
+    journal: &'a mut StagingJournal,
     manifest: &'a mut ConversionManifest,
     report: &'a mut PipelineReport,
     progress_tx: &'a Sender<ProgressEvent>,
@@ -471,6 +534,8 @@ impl ConversionBatch<'_> {
         let uastc_level = self.config.texture_uastc_level;
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
+        let staged_outputs = Arc::clone(&self.staged);
+        let expected_configuration = self.expected_configuration.to_owned();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
 
@@ -559,7 +624,15 @@ impl ConversionBatch<'_> {
                             }
                         }
 
-                        let existing_is_valid = target.is_file()
+                        // A staged output survives from an earlier run, so it
+                        // is reused only when the journal says it was produced
+                        // from the current source under the current schema and
+                        // configuration and its bytes still match the recorded
+                        // size and hash. Any other output is converted again.
+                        let staged_is_current = staged_outputs.get(&key).is_some_and(|record| {
+                            record.is_current(&target, &hash, &expected_configuration)
+                        });
+                        let existing_is_valid = staged_is_current
                             && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
                             && match source_kind.as_str() {
                                 "dds" => fs::read(&target).is_ok_and(|bytes| {
@@ -619,7 +692,9 @@ impl ConversionBatch<'_> {
 
             match conversion {
                 Ok(is_cache_hit) => {
-                    if fail_fast && first_error.is_some() {
+                    // Without fail-fast only a journal write sets the first
+                    // error, and after one nothing more can be recorded.
+                    if first_error.is_some() {
                         continue;
                     }
                     if !is_cache_hit {
@@ -672,18 +747,20 @@ impl ConversionBatch<'_> {
                             "Converted asset",
                         )
                         .await;
-                        self.manifest.entries.insert(
-                            key,
-                            CacheEntry {
-                                source_hash: hash,
-                                output: target_rel
-                                    .to_string_lossy()
-                                    .into_owned()
-                                    .replace('\\', "/"),
-                                output_size: size,
-                                output_hash,
-                            },
-                        );
+                        let entry = CacheEntry {
+                            source_hash: hash,
+                            output: target_rel.to_string_lossy().into_owned().replace('\\', "/"),
+                            output_size: size,
+                            output_hash,
+                        };
+                        if let Err(error) = self
+                            .journal
+                            .record(&key, &staged_output(&entry, self.expected_configuration))
+                        {
+                            stop_batch(&cancelled, &mut first_error, error);
+                            continue;
+                        }
+                        self.manifest.entries.insert(key, entry);
                         self.report.converted += 1;
                     } else {
                         send(
@@ -695,8 +772,17 @@ impl ConversionBatch<'_> {
                             "Converted asset",
                         )
                         .await;
-                        if let Some(entry) = self.previous.entries.get(&key) {
-                            self.manifest.entries.insert(key, entry.clone());
+                        if let Some(entry) = self.previous.entries.get(&key).cloned() {
+                            // The staged copy holds the published bytes, so the
+                            // published entry is its provenance.
+                            if let Err(error) = self
+                                .journal
+                                .record(&key, &staged_output(&entry, self.expected_configuration))
+                            {
+                                stop_batch(&cancelled, &mut first_error, error);
+                                continue;
+                            }
+                            self.manifest.entries.insert(key, entry);
                         }
                         self.report.cache_hits += 1;
                     }
@@ -1068,6 +1154,24 @@ fn staging_path(output: &Path) -> PathBuf {
     output.with_extension(format!("staging-{}-{stamp}", std::process::id()))
 }
 
+/// Where the staging journal waits while its staging directory is published.
+fn parked_journal_path(staging: &Path) -> PathBuf {
+    let mut name = staging.file_name().unwrap_or_default().to_os_string();
+    name.push(".journal.jsonl");
+    staging.with_file_name(name)
+}
+
+/// Provenance for a cache entry whose output is now complete inside staging.
+fn staged_output(entry: &CacheEntry, configuration_hash: &str) -> StagedOutput {
+    StagedOutput {
+        schema_version: CONVERTER_SCHEMA_VERSION,
+        configuration_hash: configuration_hash.to_owned(),
+        source_hash: entry.source_hash.clone(),
+        output_size: entry.output_size,
+        output_hash: entry.output_hash.clone(),
+    }
+}
+
 fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
     let backup = output.with_extension(format!("backup-{}", std::process::id()));
     if backup.exists() {
@@ -1086,6 +1190,18 @@ fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
         fs::remove_dir_all(backup)?;
     }
     Ok(())
+}
+
+/// Stops the worker pool and keeps the first error. The batch still drains
+/// its channel and awaits the pool before returning it, so no worker writes
+/// into a staging directory the caller is about to remove.
+fn stop_batch(
+    cancelled: &AtomicBool,
+    first_error: &mut Option<color_eyre::eyre::Error>,
+    error: color_eyre::eyre::Error,
+) {
+    cancelled.store(true, Ordering::Relaxed);
+    first_error.get_or_insert(error);
 }
 
 async fn send(
@@ -1303,6 +1419,95 @@ mod tests {
         assert!(failure.current_file.as_ref().is_some_and(|path| {
             path == Path::new("textures/bad.dds") || path == Path::new("textures/also-bad.dds")
         }));
+    }
+
+    fn staging_entries(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("modern.staging-")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_journal_write_failure_stops_the_batch_before_removing_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        // Enough work that workers are still converting when the first
+        // journal write fails.
+        for index in 0..400 {
+            let name = format!("Script{index}");
+            fs::write(
+                data.join(format!("scripts/{name}.pex")),
+                dummy_content::pex::minimal(&name).unwrap(),
+            )
+            .unwrap();
+        }
+
+        crate::cache::FAIL_JOURNAL_WRITES.with(|fail| fail.set(true));
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx).await;
+        crate::cache::FAIL_JOURNAL_WRITES.with(|fail| fail.set(false));
+
+        let error = result.unwrap_err();
+        assert!(format!("{error:?}").contains("injected journal write failure"));
+        // A worker left running would write into staging after it was removed.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!output.exists());
+        assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_keeps_the_journal_in_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/One.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        // A stale backup makes `publish_directory` refuse to publish.
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+        fs::create_dir_all(&backup).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:?}").contains("stale backup"));
+        let staging = staging_entries(temp.path());
+        assert_eq!(
+            staging.len(),
+            1,
+            "expected only the staging directory: {staging:?}"
+        );
+        assert!(staging[0].is_dir());
+        assert!(StagingJournal::path_in(&staging[0]).is_file());
+        assert!(!parked_journal_path(&staging[0]).exists());
+
+        // Once the backup is gone the same staging directory publishes, and
+        // neither the output nor its parent keeps the journal.
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging[0].clone());
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        AssetPipeline::run_async(config, tx).await.unwrap();
+        assert!(output.join("conversion-manifest.json").is_file());
+        assert!(!StagingJournal::path_in(&output).exists());
+        assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]
