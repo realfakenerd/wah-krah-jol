@@ -26,14 +26,13 @@ pub const fn runtime_to_creation_vector([x, y, z]: [f32; 3]) -> [f32; 3] {
 ///
 /// Creation angles turn **clockwise** about each axis (seen looking down the
 /// axis), the Gamebryo convention of a transposed rotation matrix: the stored
-/// angles describe `Rz * Ry * Rx`, and the object is rotated by its inverse,
-/// `Rx(-x) * Ry(-y) * Rz(-z)` (the same as OpenMW does for Bethesda references).
-/// For a yaw-only reference that is `Rz(-z)`: a heading measured clockwise from
-/// north, the same as an `XTEL` arrival heading. Measured on Skyrim.esm's load
-/// doors (2026-09-22): for 63 door models with 5+ placements, 88% of doors put
-/// their `XTEL` arrival point at their model's usual angle under this
-/// convention, against 42% under the counter-clockwise one used until then.
-/// The result is conjugated by the Creation-to-runtime basis.
+/// angles describe `Rz * Ry * Rx`, and the object is rotated by the inverse
+/// composition, `Rx(-x) * Ry(-y) * Rz(-z)`. A yaw-only reference is `Rz(-z)`: a
+/// heading measured clockwise from north, the same as an `XTEL` arrival heading.
+/// Recheckable on any unmodded installation by comparing each load door's `XTEL`
+/// arrival point against the heading most of that model's placements agree on;
+/// symmetric doors match under either sense. The result is conjugated by the
+/// Creation-to-runtime basis.
 pub fn creation_euler_to_runtime_quaternion([x, y, z]: [f32; 3]) -> [f32; 4] {
     let source = conjugate_quaternion(multiply_quaternions(
         axis_angle([0.0, 0.0, 1.0], z),
@@ -151,20 +150,49 @@ mod tests {
     }
 
     #[test]
-    fn converted_rotation_matches_converted_source_vector() {
-        let source_rotation = creation_euler_to_runtime_quaternion([0.3, -0.7, 1.1]);
-        let source_vector = [2.0, -3.0, 5.0];
-
-        let qx = axis_angle([1.0, 0.0, 0.0], 0.3);
-        let qy = axis_angle([0.0, 1.0, 0.0], -0.7);
-        let qz = axis_angle([0.0, 0.0, 1.0], 1.1);
-        let rotated_creation = rotate(
-            conjugate_quaternion(multiply_quaternions(qz, multiply_quaternions(qy, qx))),
-            source_vector,
+    fn combined_angles_use_the_inverse_composition() {
+        // Canonical fixture, hand-computed: with x = z = 90 degrees the inverse
+        // composition `Rx(-x) * Rz(-z)` takes Creation +X to +Z, +Y to +X and
+        // +Z to +Y; the counter-clockwise composition is its inverse and cycles
+        // +X to +Y to +Z instead.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let rotation = creation_euler_to_runtime_quaternion([quarter, 0.0, quarter]);
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([1.0, 0.0, 0.0])),
+            creation_to_runtime_vector([0.0, 0.0, 1.0]),
         );
         assert_close(
-            rotate(source_rotation, creation_to_runtime_vector(source_vector)),
-            creation_to_runtime_vector(rotated_creation),
+            rotate(rotation, creation_to_runtime_vector([0.0, 1.0, 0.0])),
+            creation_to_runtime_vector([1.0, 0.0, 0.0]),
+        );
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([0.0, 0.0, 1.0])),
+            creation_to_runtime_vector([0.0, 1.0, 0.0]),
+        );
+    }
+
+    #[test]
+    fn three_nonzero_angles_pin_the_composition_order() {
+        // Canonical fixture with every angle nonzero and no quarter turns, so no
+        // other axis order or sign convention gives the same rotation (quarter
+        // turns do alias). Expected columns are hand-computed from the matrix
+        // product Rx(-30) * Ry(-45) * Rz(-60), independent of this module.
+        let rotation = creation_euler_to_runtime_quaternion([
+            30.0_f32.to_radians(),
+            45.0_f32.to_radians(),
+            60.0_f32.to_radians(),
+        ]);
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([1.0, 0.0, 0.0])),
+            creation_to_runtime_vector([0.353_553, -0.573_223, 0.739_199]),
+        );
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([0.0, 1.0, 0.0])),
+            creation_to_runtime_vector([0.612_372, 0.739_199, 0.280_330]),
+        );
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([0.0, 0.0, 1.0])),
+            creation_to_runtime_vector([-std::f32::consts::FRAC_1_SQRT_2, 0.353_553, 0.612_372]),
         );
     }
 

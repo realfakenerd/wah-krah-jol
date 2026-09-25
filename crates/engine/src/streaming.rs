@@ -1996,13 +1996,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_creation_position_and_rotation_through_the_same_basis() {
+    fn streaming_maps_creation_transforms_through_the_shared_contract() {
         assert_eq!(creation_to_bevy(Vec3::Y), Vec3::NEG_Z);
         assert_eq!(creation_to_bevy(Vec3::Z), Vec3::Y);
 
+        // The shared contract decides the angle's sense, not the Bevy axes: this
+        // Creation yaw takes +X to runtime +Z, where a Bevy +Y turn takes it to -Z.
         let rotation = creation_rotation_to_bevy([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
         let rotated = rotation * Vec3::X;
-        // Creation yaw turns clockwise: east (+X) turns to south (-Y), runtime +Z.
         assert!(rotated.abs_diff_eq(Vec3::Z, 1.0e-5));
     }
 

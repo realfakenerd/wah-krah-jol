@@ -47,10 +47,14 @@ uma rotação usa conjugação de base:
 R_bevy = B * R_creation * inverse(B)
 ```
 
-A ordem Euler usada pelo campo `DATA` de `REFR` deve ser validada com fixtures canônicas antes de
-ser consolidada. Não serão mantidas fórmulas independentes no conversor e no runtime. O contrato e
-os vetores/matrizes de teste ficarão em um módulo pequeno de `shared`, usando arrays para não
-acoplar as versões diferentes de `glam` usadas pelo parser NIF e pelo Bevy.
+Os ângulos do campo `DATA` de `REFR` giram em sentido horário em torno de cada eixo, a convenção
+Gamebryo de matriz transposta: `R_creation` é o inverso da composição `Rz * Ry * Rx`, isto é,
+`Rx(-x) * Ry(-y) * Rz(-z)`, e um yaw puro é uma direção medida em sentido horário a partir do norte.
+A evidência: nas portas de carga do `Skyrim.esm` (2026-09-22), para 63 modelos de porta com 5 ou
+mais colocações, 88% das portas põem o ponto de chegada `XTEL` no ângulo habitual do modelo sob esta
+convenção, contra 42% sob a anti-horária usada até então. Fixtures canônicas fixam essa ordem. Não serão mantidas fórmulas independentes no conversor e no
+runtime. O contrato e os vetores/matrizes de teste ficarão em um módulo pequeno de `shared`, usando
+arrays para não acoplar as versões diferentes de `glam` usadas pelo parser NIF e pelo Bevy.
 
 ### Preservar a cena, sem assar transforms nos vértices
 
