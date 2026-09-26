@@ -195,11 +195,17 @@ impl EngineConfig {
                 "--acceptance-screenshot" => {
                     config.acceptance_screenshot = args.next().map(PathBuf::from);
                 }
-                "--screenshot-camera-offset" => {
-                    if let Some(value) = args.next().and_then(|value| parse_offset(&value)) {
-                        config.screenshot_camera_offset = Some(value);
-                    }
-                }
+                "--screenshot-camera-offset" => match args.next() {
+                    Some(raw) => match parse_offset(&raw) {
+                        Some(value) => config.screenshot_camera_offset = Some(value),
+                        None => eprintln!(
+                            "warning: ignoring malformed --screenshot-camera-offset {raw:?}; expected \"x,y,z\" floats"
+                        ),
+                    },
+                    None => eprintln!(
+                        "warning: missing value for --screenshot-camera-offset; expected \"x,y,z\" floats"
+                    ),
+                },
                 "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
                 "--material-fixture" => config.material_fixture = true,
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
