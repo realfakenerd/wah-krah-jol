@@ -66,19 +66,19 @@ impl AssetPipeline {
             "Discovering Skyrim assets",
         )
         .await;
-        let previous_manifest = if config.invalidate_cache {
+        let loaded_manifest = if config.invalidate_cache {
             ConversionManifest::default()
         } else {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
         let expected_configuration = configuration_hash(&config)?;
-        let configuration_is_compatible = previous_manifest.configuration_hash
+        let configuration_is_compatible = loaded_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12 | 13)
-                && previous_manifest.configuration_hash
-                    == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
+            || (matches!(loaded_manifest.schema_version, 12..=14)
+                && loaded_manifest.configuration_hash
+                    == configuration_hash_for_schema(&config, loaded_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
-            previous_manifest
+            loaded_manifest
         } else {
             ConversionManifest::default()
         };
@@ -88,6 +88,9 @@ impl AssetPipeline {
             .clone()
             .unwrap_or_else(|| staging_path(&config.output_dir));
         fs::create_dir_all(staging.join("vfs"))?;
+        if resumed {
+            invalidate_staged_mesh_outputs(&staging)?;
+        }
         let run_result = Self::run_into(&config, &staging, &previous_manifest, &progress_tx).await;
         let mut report = match run_result {
             Ok(report) => report,
@@ -1054,6 +1057,25 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
         })
 }
 
+fn invalidate_staged_mesh_outputs(staging: &Path) -> Result<()> {
+    let vfs = staging.join("vfs");
+    for entry in WalkDir::new(staging)
+        .into_iter()
+        .filter_entry(|entry| entry.path() != vfs.as_path())
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() && extension(entry.path(), &["glb"]) {
+            fs::remove_file(entry.path()).wrap_err_with(|| {
+                format!(
+                    "failed to invalidate staged mesh {}",
+                    entry.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Strips the leading asset kind folder (e.g., "textures", "meshes", "scripts")
 /// from a relative path in a case-insensitive manner.
 ///
@@ -1122,6 +1144,21 @@ mod tests {
             source_texture_key("textures/effects/fire.ktx2").unwrap(),
             "textures/effects/fire.ktx2"
         );
+    }
+
+    #[test]
+    fn invalidates_unversioned_staged_meshes_but_preserves_vfs() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::create_dir_all(staging.join("vfs/meshes")).unwrap();
+        fs::write(staging.join("meshes/resumable.glb"), b"mesh").unwrap();
+        fs::write(staging.join("vfs/meshes/source.glb"), b"source").unwrap();
+
+        invalidate_staged_mesh_outputs(staging).unwrap();
+
+        assert!(!staging.join("meshes/resumable.glb").exists());
+        assert!(staging.join("vfs/meshes/source.glb").is_file());
     }
 
     #[test]
@@ -1222,6 +1259,57 @@ mod tests {
                 .unwrap()
                 .complete
         );
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_publish_unverified_staged_meshes_for_any_manifest_schema() {
+        let manifests = [
+            ("absent", None),
+            (
+                "schema-14",
+                Some(
+                    br#"{"schema_version":14,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+            (
+                "schema-15",
+                Some(
+                    br#"{"schema_version":15,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+        ];
+
+        for (name, manifest) in manifests {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("Data");
+            let output = temp.path().join("modern");
+            let staging = temp.path().join("modern.staging-resume");
+            fs::create_dir_all(&data).unwrap();
+            fs::create_dir_all(&output).unwrap();
+            fs::create_dir_all(staging.join("meshes")).unwrap();
+            fs::write(staging.join("meshes/stale.glb"), b"unverified mesh").unwrap();
+            if let Some(manifest) = manifest {
+                fs::write(output.join("conversion-manifest.json"), manifest).unwrap();
+            }
+
+            let mut config = PipelineConfig::new(&data, &output);
+            config.resume_staging = Some(staging);
+            let report = run_without_progress(config).await;
+
+            assert!(report.complete, "resume failed with {name} manifest");
+            assert!(
+                !output.join("meshes/stale.glb").exists(),
+                "stale mesh published with {name} manifest"
+            );
+            assert_eq!(
+                ConversionManifest::load(&output.join("conversion-manifest.json"))
+                    .unwrap()
+                    .schema_version,
+                crate::cache::CONVERTER_SCHEMA_VERSION
+            );
+        }
     }
 
     #[tokio::test]

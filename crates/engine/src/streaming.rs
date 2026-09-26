@@ -191,12 +191,21 @@ fn plan_cells(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-    let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-    let center = IVec2::new(
-        (global_x / CELL_SIZE).floor() as i32,
-        (global_y / CELL_SIZE).floor() as i32,
-    );
+    // Screenshot runs frame the configured start cell from an artistic
+    // offset, so the camera can sit cells away from its target. Streaming
+    // around the camera would then load the wrong neighborhood and leave
+    // the framed cells empty; anchor on the start cell instead. Interactive
+    // runs keep following the camera.
+    let center = if config.acceptance_screenshot.is_some() {
+        origin.0
+    } else {
+        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
+        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
+        IVec2::new(
+            (global_x / CELL_SIZE).floor() as i32,
+            (global_y / CELL_SIZE).floor() as i32,
+        )
+    };
     let mut wanted = HashSet::new();
     for y in -config.stream_radius..=config.stream_radius {
         for x in -config.stream_radius..=config.stream_radius {
@@ -1413,23 +1422,21 @@ fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
 }
 
 fn converted_model_path(path: String) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let lowercase = normalized.to_ascii_lowercase();
-    let filename = lowercase.rsplit('/').next().unwrap_or_default();
-    if lowercase.starts_with("meshes/sky/")
-        || lowercase.starts_with("sky/")
-        || lowercase.starts_with("meshes/markers/")
-        || lowercase.starts_with("markers/")
-        || lowercase.starts_with("meshes/effects/")
-        || lowercase.starts_with("effects/")
+    // Converted assets are published with lowercase canonical paths, so the
+    // lookup must lowercase too (matching world-inspect's resolver).
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let filename = normalized.rsplit('/').next().unwrap_or_default();
+    if normalized.starts_with("meshes/sky/")
+        || normalized.starts_with("sky/")
+        || normalized.starts_with("meshes/markers/")
+        || normalized.starts_with("markers/")
+        || normalized.starts_with("meshes/effects/")
+        || normalized.starts_with("effects/")
         || filename.contains("marker")
     {
         return None;
     }
-    let without_prefix = normalized
-        .strip_prefix("meshes/")
-        .or_else(|| normalized.strip_prefix("Meshes/"))
-        .unwrap_or(&normalized);
+    let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
     if without_prefix.is_empty() {
         return None;
     }
@@ -1740,12 +1747,19 @@ fn validate_and_register_terrain_edges(
 }
 
 fn update_render_origin(
+    config: Res<EngineConfig>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    // Screenshot runs keep the start-cell origin fixed: rebasing toward an
+    // artistically offset camera would drag the streamed window (and the
+    // screenshot target's cells) away from the framed view.
+    if config.acceptance_screenshot.is_some() {
+        return;
+    }
     let started = Instant::now();
     let Ok(mut camera) = camera.single_mut() else {
         return;
@@ -1809,12 +1823,18 @@ fn validate_streaming_lifecycle(
     let orphaned_roots = root_entities.difference(&resident_entities).count() as u64;
     let missing_roots = resident_entities.difference(&root_entities).count() as u64;
     let out_of_range_roots = camera.single().map_or(0, |camera| {
-        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-        let center = IVec2::new(
-            (global_x / CELL_SIZE).floor() as i32,
-            (global_y / CELL_SIZE).floor() as i32,
-        );
+        // Must match plan_cells: screenshot runs anchor streaming on the
+        // start cell, not the camera.
+        let center = if config.acceptance_screenshot.is_some() {
+            origin.0
+        } else {
+            let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
+            let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
+            IVec2::new(
+                (global_x / CELL_SIZE).floor() as i32,
+                (global_y / CELL_SIZE).floor() as i32,
+            )
+        };
         root_entries
             .iter()
             .filter_map(|(_, _, grid)| *grid)
@@ -1888,6 +1908,11 @@ mod tests {
             Some("meshes/architecture/wall.glb")
         );
         assert_eq!(
+            converted_model_path("Meshes\\Landscape\\Tundra\\TundraStreamStraight01.NIF".into())
+                .as_deref(),
+            Some("meshes/landscape/tundra/tundrastreamstraight01.glb")
+        );
+        assert_eq!(
             converted_model_path("meshes/Sky/CloudShape01.nif".into()),
             None
         );
@@ -1930,7 +1955,8 @@ mod tests {
     #[test]
     fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
         let mut app = App::new();
-        app.insert_resource(RenderOrigin(IVec2::ZERO))
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);

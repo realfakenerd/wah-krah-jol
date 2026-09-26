@@ -33,6 +33,7 @@ mlua.workspace = true
 tempfile = "3.20"
 ruzstd = "0.8"
 dummy-content = { path = "../dummy-content" }
+project-wormhole-shared = "0.1.0"
 
 [build-dependencies]
 cc = "1.2"

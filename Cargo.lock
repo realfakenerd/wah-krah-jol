@@ -2329,6 +2329,7 @@ dependencies = [
  "nom-derive",
  "project-wormhole-esm",
  "project-wormhole-nif",
+ "project-wormhole-shared",
  "rayon",
  "rkyv",
  "rusqlite",
