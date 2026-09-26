@@ -107,6 +107,14 @@ pub struct StreamingMetrics {
     pub canonical_fixture_validated: bool,
     pub terrain_patches_validated: u64,
     pub terrain_seams_validated: u64,
+    /// Edge points of an arriving cell whose height had to move onto a resident neighbour's shared
+    /// edge, so the two terrains meet exactly instead of the cell being rejected (see
+    /// `validate_and_register_terrain_edges`).
+    pub terrain_seam_points_welded: u64,
+    /// Shared edges that differ past [`MAX_WELDABLE_EDGE_DELTA`] and are drawn as authored: a
+    /// city's sculpted landscape meeting an unsculpted copy of the land around it, which Skyrim
+    /// itself never stitches.
+    pub terrain_edges_left_as_authored: u64,
     pub terrain_validation_failures: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
@@ -164,6 +172,96 @@ struct TerrainEdges {
     east: Vec<f32>,
     south: Vec<f32>,
     north: Vec<f32>,
+}
+
+impl TerrainEdges {
+    /// The four edges of the heights `terrain` currently holds. Registering them after welding
+    /// records what was actually drawn, so the next cell welds onto the same surface.
+    fn of(terrain: &TerrainSnapshot) -> Self {
+        let samples = |side: TerrainEdgeSide| {
+            (0..side.len(terrain))
+                .map(|position| terrain.heights[side.index(terrain, position)])
+                .collect()
+        };
+        Self {
+            west: samples(TerrainEdgeSide::West),
+            east: samples(TerrainEdgeSide::East),
+            south: samples(TerrainEdgeSide::South),
+            north: samples(TerrainEdgeSide::North),
+        }
+    }
+
+    /// The heights along `side` as they were registered.
+    fn side(&self, side: TerrainEdgeSide) -> &[f32] {
+        match side {
+            TerrainEdgeSide::West => &self.west,
+            TerrainEdgeSide::East => &self.east,
+            TerrainEdgeSide::South => &self.south,
+            TerrainEdgeSide::North => &self.north,
+        }
+    }
+}
+
+/// Which side of an exterior cell an edge belongs to, and which neighbour shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerrainEdgeSide {
+    West,
+    East,
+    South,
+    North,
+}
+
+impl TerrainEdgeSide {
+    /// Every side. This is also the order [`validate_and_register_terrain_edges`] welds them in,
+    /// and for a corner the order in which its two neighbours are preferred.
+    const ALL: [Self; 4] = [Self::West, Self::East, Self::South, Self::North];
+
+    /// The side of the neighbour sharing this edge that lines up position for position with it.
+    const fn opposite(self) -> Self {
+        match self {
+            Self::West => Self::East,
+            Self::East => Self::West,
+            Self::South => Self::North,
+            Self::North => Self::South,
+        }
+    }
+
+    /// The neighbour sharing this side in the same worldspace.
+    fn neighbor_key(self, worldspace_id: u32, grid: IVec2) -> CellKey {
+        let (grid_x, grid_y) = match self {
+            Self::West => (grid.x - 1, grid.y),
+            Self::East => (grid.x + 1, grid.y),
+            Self::South => (grid.x, grid.y - 1),
+            Self::North => (grid.x, grid.y + 1),
+        };
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// How many height-field points lie along this side.
+    fn len(self, terrain: &TerrainSnapshot) -> usize {
+        match self {
+            Self::West | Self::East => usize::from(terrain.height),
+            Self::South | Self::North => usize::from(terrain.width),
+        }
+    }
+
+    /// The height-field point at `position` along this side, numbered from the same end on both
+    /// cells of a shared edge, so a cell's side lines up position for position with the
+    /// neighbour's opposite side.
+    fn index(self, terrain: &TerrainSnapshot, position: usize) -> usize {
+        let width = usize::from(terrain.width);
+        let height = usize::from(terrain.height);
+        match self {
+            Self::West => position * width,
+            Self::East => position * width + width - 1,
+            Self::South => position,
+            Self::North => (height - 1) * width + position,
+        }
+    }
 }
 
 enum CellStatus {
@@ -317,8 +415,8 @@ fn collect_cells(
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
-                let terrain = cache.terrain(payload.cell_id);
-                if let Some(terrain) = &terrain {
+                let mut terrain = cache.terrain(payload.cell_id);
+                if let Some(terrain) = &mut terrain {
                     let validation = validate_terrain_snapshot(terrain, &catalog).and_then(|()| {
                         validate_and_register_terrain_edges(
                             payload.key,
@@ -1642,9 +1740,50 @@ pub(crate) fn build_terrain_quadrant_mesh(
     Ok(mesh)
 }
 
+/// The largest difference between an arriving cell's edge and a resident neighbour's that is still
+/// treated as a seam to weld.
+///
+/// Real seams are small: the worst measured on `Skyrim.esm` is 24 units, on one of 33 points of
+/// Tamriel's (18,18) north edge against (18,19), and 16 units on one point of (18,20)'s east edge.
+/// The bound, 64 units (half the height field's 128-unit sample spacing), leaves the measured seams
+/// almost three times the room they need while staying small next to the terrain's own detail. A
+/// larger difference is not a crack but two landscapes that were authored apart - the city
+/// worldspaces' sculpted cells against the copies of Tamriel's land beside them (Markarth 520-2520
+/// units, Solitude 560-2352) - which Skyrim draws as authored, so that edge is left alone.
+const MAX_WELDABLE_EDGE_DELTA: f32 = 64.0;
+
+/// Edge heights closer than this are already the same point: the tolerance the strict comparison
+/// used before edges were welded.
+const EDGE_MATCH_TOLERANCE: f32 = 0.01;
+
+/// One side of the arriving cell that a resident neighbour can be welded onto.
+struct WeldableEdge {
+    /// Which of the arriving cell's four sides this is.
+    side: TerrainEdgeSide,
+    /// The neighbour sharing `side`.
+    neighbor: CellKey,
+    /// The neighbour's registered heights along the shared edge, position for position with `side`.
+    heights: Vec<f32>,
+    /// The largest difference the weld has to close along the edge.
+    max_delta: f32,
+}
+
+/// Registers a cell's edge heights, welding the arriving cell onto the neighbours already drawn.
+///
+/// The resident neighbour is authoritative: its mesh is in the world, so where the two disagree
+/// the arriving cell moves. This replaces the strict comparison that rejected the whole cell -
+/// and with it the terrain and its references - over a single point of one edge, which is what
+/// leaves a hole in the ground on real `Skyrim.esm` data. An edge that differs by more than
+/// [`MAX_WELDABLE_EDGE_DELTA`] is not welded and not rejected either: it is drawn as authored and
+/// counted, as Skyrim draws every `LAND` as its own mesh without comparing neighbours. What is
+/// still rejected is data that cannot be drawn: an edge of a different length and a non-finite
+/// height on either side.
+///
+/// The welded heights - not the loaded ones - are what gets registered, so a cell arriving later
+/// welds onto the surface that is actually drawn and the block stays watertight.
 fn validate_and_register_terrain_edges(
     key: CellKey,
-    terrain: &TerrainSnapshot,
+    terrain: &mut TerrainSnapshot,
     continuity: &mut TerrainContinuity,
     metrics: &mut StreamingMetrics,
 ) -> Result<(), String> {
@@ -1658,85 +1797,207 @@ fn validate_and_register_terrain_edges(
     };
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
-    let edges = TerrainEdges {
-        west: (0..height)
-            .map(|row| terrain.heights[row * width])
-            .collect(),
-        east: (0..height)
-            .map(|row| terrain.heights[row * width + width - 1])
-            .collect(),
-        south: terrain.heights[..width].to_vec(),
-        north: terrain.heights[(height - 1) * width..].to_vec(),
-    };
-    let neighbors = [
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x - 1,
-                grid_y,
-            },
-            &edges.west,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x + 1,
-                grid_y,
-            },
-            &edges.east,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y - 1,
-            },
-            &edges.south,
-            false,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y + 1,
-            },
-            &edges.north,
-            false,
-        ),
-    ];
-    for (neighbor_key, edge, horizontal) in neighbors {
+    // `validate_terrain_snapshot` checks these on the loading path, but the point indices below are
+    // computed here, and a non-finite height would be welded into the neighbours' shared edges while
+    // `f32::max` kept quiet about it, so the field this function relies on is checked here too.
+    if width < 2 || height < 2 || terrain.heights.len() != width * height {
+        return Err(format!(
+            "terrain must hold a height field of at least 2x2: {width}x{height} with {} heights",
+            terrain.heights.len()
+        ));
+    }
+    if terrain.heights.iter().any(|height| !height.is_finite()) {
+        return Err("terrain contains a non-finite height".to_owned());
+    }
+    let grid = IVec2::new(grid_x, grid_y);
+    // Every shared edge is read before any height moves, so a rejected cell is left exactly as it
+    // was loaded even when an earlier edge turned out to be weldable.
+    let mut weldable = Vec::new();
+    for side in TerrainEdgeSide::ALL {
+        let neighbor_key = side.neighbor_key(worldspace_id, grid);
         let Some(neighbor) = continuity.edges.get(&neighbor_key) else {
             continue;
         };
-        let other = if horizontal {
-            if matches!(neighbor_key, CellKey::Exterior { grid_x: neighbor_x, .. } if neighbor_x < grid_x)
-            {
-                &neighbor.east
-            } else {
-                &neighbor.west
-            }
-        } else if matches!(neighbor_key, CellKey::Exterior { grid_y: neighbor_y, .. } if neighbor_y < grid_y)
-        {
-            &neighbor.north
-        } else {
-            &neighbor.south
-        };
-        if edge.len() != other.len()
-            || edge
-                .iter()
-                .zip(other)
-                .any(|(left, right)| (left - right).abs() > 0.01)
-        {
+        let other = neighbor.side(side.opposite());
+        if side.len(terrain) != other.len() {
             return Err(format!(
-                "terrain edge does not match neighbor {neighbor_key:?}"
+                "terrain edge {side:?} has {} points; neighbor {neighbor_key:?} has {}",
+                side.len(terrain),
+                other.len()
             ));
+        }
+        if other.iter().any(|height| !height.is_finite()) {
+            return Err(format!(
+                "terrain edge {side:?} of neighbor {neighbor_key:?} is not finite"
+            ));
+        }
+        let max_delta = (0..side.len(terrain))
+            .map(|position| {
+                (terrain.heights[side.index(terrain, position)] - other[position]).abs()
+            })
+            .fold(0.0_f32, f32::max);
+        if max_delta > MAX_WELDABLE_EDGE_DELTA {
+            // Two landscapes authored apart, not a crack: rejecting the cell dropped its terrain
+            // and every reference on it, the holes in Markarth's and Solitude's ground.
+            warn!(
+                ?key,
+                neighbor = ?neighbor_key,
+                side = ?side,
+                max_delta,
+                "terrain edge differs from its neighbour past the weld bound; drawn as authored"
+            );
+            metrics.terrain_edges_left_as_authored =
+                metrics.terrain_edges_left_as_authored.saturating_add(1);
+            continue;
+        }
+        weldable.push(WeldableEdge {
+            side,
+            neighbor: neighbor_key,
+            heights: other.to_vec(),
+            max_delta,
+        });
+    }
+    let mut welded_points = Vec::new();
+    for edge in &weldable {
+        // The points at the two ends of a side are its corners, welded once each below.
+        let mut moved = 0u64;
+        for position in 1..edge.side.len(terrain) - 1 {
+            let index = edge.side.index(terrain, position);
+            let height = edge.heights[position];
+            if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
+                welded_points.push(index);
+                moved += 1;
+            }
+            terrain.heights[index] = height;
+        }
+        if moved > 0 {
+            debug!(
+                cell = format_args!("{:08X}", terrain.cell_id),
+                neighbor = ?edge.neighbor,
+                max_delta = edge.max_delta,
+                moved,
+                "LAND edge welded onto the resident neighbor"
+            );
         }
         metrics.terrain_seams_validated = metrics.terrain_seams_validated.saturating_add(1);
     }
-    continuity.edges.insert(key, edges);
+    // A corner point is the end of two sides, so welding it with both would write it twice - the
+    // later side winning - and count it twice. The two neighbours meeting there can disagree as
+    // well, since they share only that point and never an edge, and then the arriving corner cannot
+    // agree with both of them. Each corner is therefore welded last and once, to the first of its
+    // two sides that has a resident neighbour: the corner follows a single neighbour, and what is
+    // left where the two disagree is the difference they already had between them, which no
+    // arriving cell can close.
+    let corners = [
+        (0, TerrainEdgeSide::West, TerrainEdgeSide::South),
+        (width - 1, TerrainEdgeSide::East, TerrainEdgeSide::South),
+        (
+            (height - 1) * width,
+            TerrainEdgeSide::West,
+            TerrainEdgeSide::North,
+        ),
+        (
+            height * width - 1,
+            TerrainEdgeSide::East,
+            TerrainEdgeSide::North,
+        ),
+    ];
+    for (index, first, second) in corners {
+        // The corner's row along a vertical side and its column along a horizontal one: how the
+        // point sits on each of the two sides.
+        let corner = [first, second].into_iter().find_map(|side| {
+            let edge = weldable.iter().find(|edge| edge.side == side)?;
+            let position = match side {
+                TerrainEdgeSide::West | TerrainEdgeSide::East => index / width,
+                TerrainEdgeSide::South | TerrainEdgeSide::North => index % width,
+            };
+            Some((side, edge.heights[position]))
+        });
+        let Some((side, height)) = corner else {
+            continue;
+        };
+        if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
+            welded_points.push(index);
+            terrain.heights[index] = height;
+            debug!(
+                cell = format_args!("{:08X}", terrain.cell_id),
+                corner = index,
+                side = ?side,
+                height,
+                "LAND corner welded onto the resident neighbor"
+            );
+        }
+    }
+    if !welded_points.is_empty() {
+        // A moved point no longer lies where its stored normal was computed, and the drawn
+        // triangle is what gets shaded, so recompute it from the welded field. Real seams have
+        // the two sides' normals already matching, so keeping the loaded ones would shade the
+        // boundary exactly like the neighbour at the cost of a normal that disagrees with our
+        // own geometry. The normals of the points beside a moved one are computed from its
+        // height too, so they are recomputed as well.
+        recompute_packed_normals(terrain, &points_and_neighbours(terrain, &welded_points));
+        metrics.terrain_seam_points_welded = metrics
+            .terrain_seam_points_welded
+            .saturating_add(welded_points.len() as u64);
+    }
+    continuity.edges.insert(key, TerrainEdges::of(terrain));
     Ok(())
+}
+
+/// Recomputes the packed `VNML` bytes of the listed height-field points from the heights around
+/// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
+/// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled to
+/// the `i8` range. `points` index a complete `width * height` field.
+/// The given sample indices and their in-bounds cardinal neighbours, sorted and without
+/// duplicates: every sample whose normal reads the height of a given one.
+fn points_and_neighbours(terrain: &TerrainSnapshot, points: &[usize]) -> Vec<usize> {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    let mut all = Vec::with_capacity(points.len() * 5);
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        all.push(index);
+        if x > 0 {
+            all.push(index - 1);
+        }
+        if x + 1 < width {
+            all.push(index + 1);
+        }
+        if y > 0 {
+            all.push(index - width);
+        }
+        if y + 1 < height {
+            all.push(index + width);
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    if width < 2 || height < 2 || terrain.normals.len() != width * height * 3 {
+        return;
+    }
+    let step = CELL_SIZE / (width - 1) as f32;
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        let left = terrain.heights[y * width + x.saturating_sub(1)];
+        let right = terrain.heights[y * width + (x + 1).min(width - 1)];
+        let down = terrain.heights[y.saturating_sub(1) * width + x];
+        let up = terrain.heights[(y + 1).min(height - 1) * width + x];
+        let normal = Vec3::new(left - right, down - up, 2.0 * step).normalize_or(Vec3::Z);
+        // A height field's own normal always has a positive up component, so the packed bytes can
+        // never come out all zero - which is what the validation rejects.
+        let byte = |component: f32| (component * 127.0).round().clamp(-127.0, 127.0) as i8;
+        terrain.normals[index * 3..index * 3 + 3].copy_from_slice(&[
+            byte(normal.x),
+            byte(normal.y),
+            byte(normal.z),
+        ]);
+    }
 }
 
 fn update_render_origin(
@@ -2028,50 +2289,259 @@ mod tests {
         assert_eq!(uvs[16 * 17 + 16], [1.0, 1.0]);
     }
 
+    fn exterior_cell(grid_x: i32, grid_y: i32) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// The seam measured on real data - Tamriel (18,18) against (18,19), one point of the north
+    /// edge 24 units off, across a sample step of 128 units - used to reject the whole cell and
+    /// leave a hole where the player stands. It must weld, and nothing but that point may move.
     #[test]
-    fn accepts_matching_neighbor_edges_and_rejects_cracks() {
+    fn welds_one_point_of_a_shared_edge_below_the_tolerance() {
         let mut continuity = TerrainContinuity::default();
         let mut metrics = StreamingMetrics::default();
-        let west = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 0,
-            grid_y: 0,
-        };
-        let east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 1,
-            grid_y: 0,
-        };
+        let mut resident = terrain_fixture(1, 10.0);
         validate_and_register_terrain_edges(
-            west,
-            &terrain_fixture(1, 10.0),
+            exterior_cell(0, 0),
+            &mut resident,
             &mut continuity,
             &mut metrics,
         )
         .unwrap();
-        validate_and_register_terrain_edges(
-            east,
-            &terrain_fixture(2, 10.0),
-            &mut continuity,
-            &mut metrics,
-        )
-        .unwrap();
-        assert_eq!(metrics.terrain_seams_validated, 1);
-
-        let farther_east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 2,
-            grid_y: 0,
-        };
-        assert!(
-            validate_and_register_terrain_edges(
-                farther_east,
-                &terrain_fixture(3, 11.0),
-                &mut continuity,
-                &mut metrics
-            )
-            .is_err()
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the first cell has no registered neighbor to match"
         );
+
+        // The arriving cell matches its resident neighbour along the shared edge except at one
+        // point of it, and steps up one sample in from the edge so the weld is visible in the
+        // normals as well as in the heights.
+        let mut arriving = terrain_fixture(2, 10.0);
+        for row in 0..33 {
+            arriving.heights[row * 33 + 1] = 100.0;
+        }
+        arriving.heights[7 * 33] = 34.0;
+        let loaded = arriving.heights.clone();
+        validate_and_register_terrain_edges(
+            exterior_cell(1, 0),
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.terrain_seams_validated, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+        for (index, height) in arriving.heights.iter().enumerate() {
+            if index % 33 == 0 {
+                assert_eq!(*height, 10.0, "the shared edge is the resident's");
+            } else {
+                assert_eq!(
+                    *height, loaded[index],
+                    "a point that is not on the shared edge must not move"
+                );
+            }
+        }
+        // Both sides of the seam now hold the same heights, which is what keeps the block
+        // watertight for the next cell to arrive.
+        let registered = continuity.edges.get(&exterior_cell(1, 0)).unwrap();
+        assert_eq!(registered.west, vec![10.0; 33]);
+        assert_eq!(
+            continuity.edges.get(&exterior_cell(0, 0)).unwrap().east,
+            registered.west
+        );
+        // The moved point's normal was recomputed from the welded field: (left - right,
+        // down - up, 2 * step) = (10 - 100, 0, 256) normalized and scaled to the `i8` range,
+        // rather than the [0, 0, 127] it was loaded with.
+        assert_eq!(
+            &arriving.normals[7 * 33 * 3..7 * 33 * 3 + 3],
+            &[-42, 0, 120]
+        );
+        assert_eq!(
+            &arriving.normals[..3],
+            &[0, 0, 127],
+            "a point that did not move keeps its normal"
+        );
+    }
+
+    /// A corner point is the end of two sides, so both of them would weld it; with the two
+    /// residents disagreeing there the later side won, the point was counted twice, and one of the
+    /// two neighbours was left with the crack. The corner follows the first of its two neighbours
+    /// instead, which keeps the difference the residents already had between them and no arriving
+    /// cell can close.
+    #[test]
+    fn welds_a_corner_once_to_the_first_resident_neighbour() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        // Two residents sharing only the corner of the arriving cell: (0,1) to its west and (1,0)
+        // to its south, 24 units apart there - the worst seam measured on real data.
+        for (key, cell_id, height) in [
+            (exterior_cell(0, 1), 1, 10.0),
+            (exterior_cell(1, 0), 2, 34.0),
+        ] {
+            validate_and_register_terrain_edges(
+                key,
+                &mut terrain_fixture(cell_id, height),
+                &mut continuity,
+                &mut metrics,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the two residents are diagonal and share no edge"
+        );
+
+        // The arriving cell matches the west resident along their whole shared edge except at the
+        // corner, where it holds the south resident's height.
+        let mut arriving = terrain_fixture(3, 34.0);
+        for row in 0..33 {
+            arriving.heights[row * 33] = 10.0;
+        }
+        arriving.heights[0] = 34.0;
+        validate_and_register_terrain_edges(
+            exterior_cell(1, 1),
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.terrain_seams_validated, 2);
+        assert_eq!(
+            metrics.terrain_seam_points_welded, 1,
+            "the corner is welded once, not once per side"
+        );
+        assert_eq!(
+            arriving.heights[0], 10.0,
+            "the corner follows West, its first side with a resident neighbour"
+        );
+        assert_eq!(
+            arriving.heights[32], 34.0,
+            "the other end of the south edge follows the south resident"
+        );
+        let registered = continuity.edges.get(&exterior_cell(1, 1)).unwrap();
+        assert_eq!(registered.west, vec![10.0; 33]);
+        let mut expected_south = vec![34.0; 33];
+        expected_south[0] = 10.0;
+        assert_eq!(
+            registered.south, expected_south,
+            "the south edge matches the south resident apart from the shared corner"
+        );
+        assert_eq!(
+            continuity.edges.get(&exterior_cell(1, 0)).unwrap().north[0],
+            34.0,
+            "the residents do not move, so the corner keeps the difference they already had"
+        );
+        // The welded corner's normal comes from the welded field: (left - right, down - up,
+        // 2 * step) = (10 - 34, 10 - 10, 256) over a sample step of 128 units, normalized
+        // (length 257.122) and scaled by 127, rather than the [0, 0, 127] it was loaded with.
+        assert_eq!(&arriving.normals[..3], &[-12, 0, 126]);
+    }
+
+    /// Past the bound the edge is not a seam: it is left as authored, the way Skyrim draws every
+    /// LAND on its own. The cell is kept, its other edges within the bound are still welded, and
+    /// every edge is registered.
+    #[test]
+    fn keeps_a_cell_whose_edge_differs_past_the_weld_bound_as_authored() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        for (key, cell_id) in [(exterior_cell(0, 0), 1), (exterior_cell(1, 1), 3)] {
+            validate_and_register_terrain_edges(
+                key,
+                &mut terrain_fixture(cell_id, 10.0),
+                &mut continuity,
+                &mut metrics,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the two residents are diagonal and share no edge"
+        );
+
+        // The west edge is a weldable seam; the north edge is past the bound, as where a city's
+        // sculpted landscape meets the unsculpted land beside it.
+        let mut arriving = terrain_fixture(2, 10.0);
+        arriving.heights[7 * 33] = 34.0;
+        let authored = 10.0 + MAX_WELDABLE_EDGE_DELTA + 1.0;
+        arriving.heights[32 * 33 + 15] = authored;
+        let key = exterior_cell(1, 0);
+        validate_and_register_terrain_edges(key, &mut arriving, &mut continuity, &mut metrics)
+            .expect(
+                "an edge past the weld bound is drawn as authored, not a reason to drop the cell",
+            );
+        assert_eq!(
+            arriving.heights[7 * 33],
+            10.0,
+            "the weldable west seam is welded"
+        );
+        assert_eq!(
+            arriving.heights[32 * 33 + 15],
+            authored,
+            "the edge past the bound keeps its authored heights"
+        );
+        assert!(
+            continuity.edges.contains_key(&key),
+            "the kept cell registers its edges for the cells that arrive after it"
+        );
+        assert_eq!(metrics.terrain_edges_left_as_authored, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+    }
+
+    #[test]
+    fn recomputes_packed_normals_from_the_surrounding_heights() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let index = 5 * 33 + 5;
+        terrain.heights[index + 1] = 100.0;
+        recompute_packed_normals(&mut terrain, &[index]);
+        // (left - right, down - up, 2 * step) = (-100, 0, 256) over a sample step of 128 units,
+        // normalized (length 274.838) and scaled by 127, as the converter's `decode_normals` does.
+        assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[-46, 0, 118]);
+        assert_eq!(
+            &terrain.normals[..3],
+            &[0, 0, 127],
+            "a point that was not listed keeps its normal"
+        );
+    }
+
+    #[test]
+    fn a_moved_point_also_refreshes_its_neighbours_normals() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let index = 5 * 33 + 5;
+        terrain.heights[index] = 100.0;
+        let points = points_and_neighbours(&terrain, &[index]);
+        assert_eq!(
+            points,
+            vec![index - 33, index - 1, index, index + 1, index + 33]
+        );
+        recompute_packed_normals(&mut terrain, &points);
+        // Each neighbour's normal reads the moved height: (left - right, down - up, 2 * step)
+        // with 100 on one side, (100, 0, 256) normalized and scaled by 127.
+        assert_eq!(
+            &terrain.normals[(index + 1) * 3..(index + 1) * 3 + 3],
+            &[46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 1) * 3..(index - 1) * 3 + 3],
+            &[-46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index + 33) * 3..(index + 33) * 3 + 3],
+            &[0, 46, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 33) * 3..(index - 33) * 3 + 3],
+            &[0, -46, 118]
+        );
+        // The moved point itself sits between equal heights, so it stays flat.
+        assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[0, 0, 127]);
+        // A corner has only two neighbours.
+        assert_eq!(points_and_neighbours(&terrain, &[0]), vec![0, 1, 33]);
     }
 
     #[test]
