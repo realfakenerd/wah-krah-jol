@@ -29,7 +29,7 @@ cargo run -p engine --bin world-inspect -- modern_assets 1 0 0 --radius 1
 
 ```text
 dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
-                  [--with-interior]
+                  [--with-interior | --with-lights]
 ```
 
 - `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
@@ -41,6 +41,13 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
   cell of the generated worldspace, its auto-load door into one interior cell, and the return
   door. The plugin is written through the same atomic, symlink-refusing writer as every other
   generated file.
+- `--with-lights` — replace `Skyrim.esm` with the light preset (needs `esm`): one exterior cell
+  of the generated worldspace, one `LIGH` base record, and the single reference that places it,
+  carrying the light's own `XRDS` radius. Written through the same writer as every other
+  generated file.
+
+The two presets each replace `Skyrim.esm`, so they are alternatives: passing both is an error.
+The `esm` format has to be included for either.
 
 ## Generated tree
 
@@ -56,7 +63,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 | `Skyrim - Misc.bsa` | SSE `v105` BSA (24-byte folder records) with zlib payloads. |
 | `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
 | `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
-| `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. With `--with-interior`, one exterior cell, an interior cell and a reciprocal `DOOR`/`XTEL` pair instead. |
+| `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. With `--with-interior`, one exterior cell, an interior cell and a reciprocal `DOOR`/`XTEL` pair instead. With `--with-lights`, one exterior cell, one `LIGH` base record and the one `REFR` that places it with an `XRDS` radius override. |
 
 ## Library API
 
@@ -84,8 +91,10 @@ Supported writers:
   `BSLightingShaderProperty` + `BSShaderTextureSet`) with validated geometry.
 - `esm`: a minimal plugin (`TES4`, `WRLD`, `CELL`, `LAND`, `STAT`, `REFR`, `TXST`, `LTEX`),
   optionally with an interior cell and a reciprocal `DOOR`/`XTEL` load door pair
-  (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`). Exports into `skyrim_world.db`
-  (schema 3) and `cell_cache.rkyv`.
+  (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`), or with a `LIGH` base record whose
+  `DATA` is the 48-byte layout `Skyrim.esm` uses, an `FNAM` fade and one reference carrying an
+  `XRDS` radius override (`esm::PRESET_LIGHT`, `esm::plugin_with_lights`). Exports into
+  `skyrim_world.db` (schema 3) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal. `layout::generate`
   writes the default tree and `layout::write_plugin` publishes a caller-built `Skyrim.esm` —
   the interior preset included — through the same writer and the same constants
@@ -117,6 +126,10 @@ client would consume; the [ADRs](../../adr/README.md) record the reasoning:
   subrecords `is_form_id_subrecord` recognises as 4-byte FormIDs, and `XTEL` is not one of them.
   The destination ids are therefore correct only while the fixture is the single plugin at
   load-order index 0, which is how `dummy-content gen` writes it. Nothing consumes `XTEL` yet.
+- A light reference's `XRDS` is a single little-endian `f32` rather than a FormID, so the
+  load-order remap leaves it alone and a reader gets the value as written. The base record's
+  `DATA` puts the radius at bytes 4..8 (`u32`), the colour at 8..11, the flags at 12..16 (`u32`)
+  and the falloff exponent at 16..20 (`f32`); `FNAM` is the fade (`f32`).
 
 ## Validating with a local game install
 
@@ -145,4 +158,5 @@ in the converter unit tests; the generated pipeline is covered end to end by
 `crates/converter/tests/fixture_round_trip.rs`, and the `--with-interior` tree by
 `crates/converter/tests/fixture_interior_pipeline.rs` (which asserts the exported world's
 `references_without_model` count) together with the parser-level checks in
-`crates/converter/tests/fixture_doors.rs`.
+`crates/converter/tests/fixture_doors.rs`. The `--with-lights` plugin's `LIGH` `DATA`/`FNAM`
+bytes and its reference's `XRDS` are read back by `crates/converter/tests/fixture_lights.rs`.
