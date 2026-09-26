@@ -170,7 +170,7 @@ if ($Assets) {
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
             $integration = Get-Content -LiteralPath (Join-Path $resolvedAssets "integration-report.json") -Raw | ConvertFrom-Json
-            Add-Preflight "database-schema" ($integration.schema_version -eq 3) "schema=$($integration.schema_version), expected=3"
+            Add-Preflight "database-schema" ($integration.schema_version -eq 4) "schema=$($integration.schema_version), expected=4"
             Add-Preflight "integration-report-passed" ([bool]$integration.passed) "passed=$($integration.passed)"
         } catch { Add-Preflight "integration-report-valid" $false $_.Exception.Message }
     }

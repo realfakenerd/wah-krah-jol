@@ -353,6 +353,7 @@ fn collect_cells(
                     &mut terrain_materials,
                     &mut water_materials,
                     origin.0,
+                    config.lights,
                     payload,
                     terrain,
                     &mut profiler,
@@ -424,6 +425,7 @@ fn spawn_cell(
     terrain_materials: &mut Assets<TerrainMaterial>,
     water_materials: &mut Assets<WaterMaterial>,
     origin: IVec2,
+    lights: bool,
     payload: CellPayload,
     terrain: Option<TerrainSnapshot>,
     profiler: &mut ProfilingState,
@@ -559,6 +561,27 @@ fn spawn_cell(
             ));
             if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
+            }
+            // A child of the reference, so the light sits where the reference is and follows it
+            // through a render-origin rebase - and, because it is a descendant of the cell root,
+            // through the cell unload that despawns the reference.
+            if lights
+                && let Some(light) = reference.light.as_ref().and_then(|row| {
+                    crate::lights::point_light(row, reference.light_radius_override)
+                })
+            {
+                // A reference without a model has no visibility components, so its light child
+                // could never become visible: Bevy warned (B0004) and extract_lights dropped every
+                // such light. The reference needs Visibility for the hierarchy to propagate.
+                entity.insert(Visibility::default());
+                entity.with_child((
+                    Name::new(format!("Light {:08X}", reference.form_id)),
+                    light,
+                    crate::lights::SkyrimLight {
+                        form_id: reference.form_id,
+                        cell_id: reference.cell_id,
+                    },
+                ));
             }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
                 entity.insert((
@@ -2762,5 +2785,267 @@ mod tests {
         assert_eq!(nodes, DEPTH + 2);
         assert_eq!(bounded_meshes, 1);
         assert_eq!((min, max), (Vec3::splat(-0.5), Vec3::splat(0.5)));
+    }
+
+    use crate::world::database::{LightRow, ReferenceRow};
+
+    fn light_row(radius: f32, color: [u8; 3], flags: u32) -> LightRow {
+        LightRow {
+            radius,
+            color,
+            flags,
+        }
+    }
+
+    /// A reference in interior cell 99 with a light row and, optionally, an `XRDS` radius of its
+    /// own, as the database hands one to `spawn_cell`. The model path is empty: the light does not
+    /// depend on the reference having a model - that is the case it has to work for.
+    fn lit_reference(
+        form_id: u32,
+        light: Option<LightRow>,
+        radius_override: Option<f32>,
+    ) -> ReferenceRow {
+        ReferenceRow {
+            form_id,
+            cell_id: 99,
+            base_form_id: 0x200 + form_id,
+            model_path: None,
+            position: [100.0, 50.0, -200.0],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            bounds_valid: false,
+            light,
+            light_radius_override: radius_override,
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct QueuedReferences(Vec<ReferenceRow>);
+
+    /// The cell root the last [`spawn_queued_references`] produced.
+    #[derive(Resource, Default)]
+    struct SpawnedCellRoot(Option<Entity>);
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_queued_references(
+        mut commands: Commands,
+        config: Res<EngineConfig>,
+        queued: Res<QueuedReferences>,
+        mut root: ResMut<SpawnedCellRoot>,
+        asset_server: Res<AssetServer>,
+        catalog: Res<AssetCatalog>,
+        reflection: Res<WaterReflectionTexture>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+        mut water_materials: ResMut<Assets<WaterMaterial>>,
+        mut profiler: ResMut<ProfilingState>,
+    ) {
+        root.0 = Some(spawn_cell(
+            &mut commands,
+            &asset_server,
+            &catalog,
+            &reflection,
+            &mut meshes,
+            &mut terrain_materials,
+            &mut water_materials,
+            IVec2::ZERO,
+            config.lights,
+            CellPayload {
+                generation: 1,
+                key: CellKey::Interior(99),
+                cell_id: 99,
+                references: queued.0.clone(),
+            },
+            None,
+            &mut profiler,
+        ));
+    }
+
+    /// An empty catalogue database: the three tables [`AssetCatalog::open`] reads, with no rows.
+    fn write_empty_catalogue(path: &std::path::Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+    }
+
+    /// An app that spawns one interior cell holding `references` through the real [`spawn_cell`],
+    /// with the engine's lights flag set as `lights`.
+    fn spawn_reference_cell_app(references: Vec<ReferenceRow>, lights: bool) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&path);
+        let config = EngineConfig {
+            lights,
+            ..default()
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(AssetCatalog::open(&path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(QueuedReferences(references))
+            .init_resource::<SpawnedCellRoot>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, spawn_queued_references);
+        app.update();
+        app
+    }
+
+    /// Every reference the cell spawned, by the form id it was placed with.
+    fn reference_entity(app: &App, form_id: u32) -> Entity {
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        app.world()
+            .entity(root)
+            .get::<Children>()
+            .expect("the cell root has the references as children")
+            .iter()
+            .find(|child| {
+                app.world()
+                    .entity(*child)
+                    .get::<FormId>()
+                    .is_some_and(|id| id.0 == form_id)
+            })
+            .expect("the reference spawned")
+    }
+
+    /// One lit reference, one negative light, one flagged off by default and one plain reference:
+    /// exactly one `PointLight` comes out, carrying the reference's own radius and colour.
+    #[test]
+    fn spawns_one_point_light_for_a_lit_reference() {
+        let mut app = spawn_reference_cell_app(
+            vec![
+                lit_reference(
+                    0x100,
+                    Some(light_row(256.0, [255, 200, 120], 0)),
+                    Some(850.8),
+                ),
+                lit_reference(0x101, Some(light_row(512.0, [80, 80, 90], 0x4)), None),
+                lit_reference(0x102, Some(light_row(512.0, [80, 80, 90], 0x20)), None),
+                lit_reference(0x103, None, None),
+            ],
+            true,
+        );
+
+        let lights: Vec<(Entity, PointLight, crate::lights::SkyrimLight)> = {
+            let mut query = app
+                .world_mut()
+                .query::<(Entity, &PointLight, &crate::lights::SkyrimLight)>();
+            query
+                .iter(app.world())
+                .map(|(entity, light, marker)| (entity, *light, *marker))
+                .collect()
+        };
+        assert_eq!(
+            lights.len(),
+            1,
+            "the negative and off-by-default lights spawn none"
+        );
+        let (light_entity, light, marker) = lights[0];
+        assert_eq!(marker.form_id, 0x100);
+        assert_eq!(marker.cell_id, 99);
+        assert_eq!(
+            light.range, 850.8,
+            "the reference's XRDS radius wins over the record's 256"
+        );
+        assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
+        assert!(
+            (light.intensity - crate::lights::intensity_for_radius(850.8)).abs() < 1.0e3,
+            "{}",
+            light.intensity
+        );
+        assert!(!light.shadow_maps_enabled);
+
+        // The light has to be inside the cell root: that hierarchy is what a render-origin rebase
+        // moves and what a cell unload despawns.
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        assert!(app.world().entity(root).get::<StreamedCellRoot>().is_some());
+        let reference = app
+            .world()
+            .entity(light_entity)
+            .get::<ChildOf>()
+            .expect("the light is a child of its reference")
+            .parent();
+        assert_eq!(
+            app.world().entity(reference).get::<FormId>(),
+            Some(&FormId(0x100))
+        );
+        assert!(
+            app.world().entity(reference).get::<Visibility>().is_some(),
+            "the reference of a light needs `Visibility`, or the light child can never be visible"
+        );
+        assert_eq!(
+            app.world()
+                .entity(reference)
+                .get::<ChildOf>()
+                .expect("the reference is a child of the cell root")
+                .parent(),
+            root
+        );
+        // The cell's other references are spawned exactly as before, and the unlit one gets no
+        // child at all.
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x103))
+                .get::<Children>()
+                .is_none(),
+            "a reference with no light row spawns no light child"
+        );
+    }
+
+    /// The flag is the whole switch: the same cell places no light at all without `--lights`, and
+    /// the references themselves are spawned exactly as before.
+    #[test]
+    fn places_no_light_without_the_lights_flag() {
+        let mut app = spawn_reference_cell_app(
+            vec![lit_reference(
+                0x100,
+                Some(light_row(256.0, [255, 200, 120], 0)),
+                Some(850.8),
+            )],
+            false,
+        );
+
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, (With<PointLight>, With<crate::lights::SkyrimLight>)>();
+        assert_eq!(
+            query.iter(app.world()).count(),
+            0,
+            "a lit reference places nothing while the flag is off"
+        );
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        assert!(app.world().entity(root).get::<StreamedCellRoot>().is_some());
+        assert_eq!(
+            app.world()
+                .entity(reference_entity(&app, 0x100))
+                .get::<FormId>(),
+            Some(&FormId(0x100)),
+            "and the reference is still spawned"
+        );
     }
 }

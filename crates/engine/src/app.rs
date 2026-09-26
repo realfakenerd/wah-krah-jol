@@ -125,6 +125,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             RenderDiagnosticsPlugin,
         ))
         .add_plugins(VercidiumRendererPlugin)
+        // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
+        // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
+        .add_plugins(crate::lights::LightsPlugin)
         .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -225,7 +228,7 @@ impl StreamingFixtureDirectory {
         let connection = Connection::open(&database_path)?;
         connection.execute_batch(
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(3);
+            INSERT INTO schema_info VALUES(4);
             CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -1287,7 +1290,9 @@ fn setup_world(
     ));
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.55, 0.7),
-        brightness: 160.0,
+        // The one definition of the ambient this world path applies: the converted lights are
+        // scaled against it (`crate::lights`).
+        brightness: crate::lights::AMBIENT_ILLUMINANCE,
         ..default()
     });
     info!(
@@ -1536,7 +1541,10 @@ mod tests {
         .unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":3,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         )
         .unwrap();
         let config = EngineConfig {
@@ -1562,7 +1570,10 @@ mod tests {
             .unwrap();
             std::fs::write(
                 directory.path().join("integration-report.json"),
-                br#"{"schema_version":3,"passed":true}"#,
+                format!(
+                    r#"{{"schema_version":{},"passed":true}}"#,
+                    shared::WORLD_DATABASE_SCHEMA_VERSION
+                ),
             )
             .unwrap();
             std::fs::write(directory.path().join(truncated_file), b"{").unwrap();

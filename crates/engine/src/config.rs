@@ -35,6 +35,9 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
+    /// Whether a streamed `LIGH` reference places a point light (`--lights`). Off by default, so
+    /// every run that does not ask for lights renders exactly as it did before.
+    pub lights: bool,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +75,7 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
+            lights: false,
         }
     }
 }
@@ -199,6 +203,7 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
+                "--lights" => config.lights = true,
                 _ => {}
             }
         }
@@ -261,6 +266,7 @@ mod tests {
                 "--transform-bounds-fixture",
                 "--renderer-fixture",
                 "--streaming-fixture",
+                "--lights",
             ]
             .map(str::to_owned),
         );
@@ -289,5 +295,18 @@ mod tests {
         assert!(config.transform_bounds_fixture);
         assert!(config.renderer_fixture);
         assert!(config.streaming_fixture);
+        assert!(config.lights);
+    }
+
+    /// Lights are opt-in: the flag is off unless it is given, so the default run - and every
+    /// acceptance or benchmark baseline taken from one - is unchanged.
+    #[test]
+    fn lights_are_off_until_the_flag_is_given() {
+        assert!(!EngineConfig::default().lights);
+        assert!(
+            !EngineConfig::from_args(["--headless"].map(str::to_owned)).lights,
+            "another flag does not turn lights on"
+        );
+        assert!(EngineConfig::from_args(["--lights"].map(str::to_owned)).lights);
     }
 }
