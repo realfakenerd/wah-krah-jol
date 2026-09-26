@@ -1489,6 +1489,7 @@ fn screenshot_assets_ready(
     metrics.pending_asset_instances == 0
         && metrics.pending_surface_instances == 0
         && metrics.loading_cells == 0
+        && metrics.failed_cells == 0
         && (!world_streaming_active || metrics.resident_cells > 0)
         && metrics.asset_load_failures == 0
         && metrics.material_validation_failures == 0
@@ -1524,6 +1525,10 @@ mod tests {
         let mut settled_metrics = metrics;
         settled_metrics.resident_cells = 1;
         assert!(screenshot_assets_ready(&settled_metrics, true, &config));
+
+        let mut failed_metrics = settled_metrics;
+        failed_metrics.failed_cells = 1;
+        assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
     }
 
     #[test]

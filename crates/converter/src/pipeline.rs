@@ -71,7 +71,6 @@ impl AssetPipeline {
         } else {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
-        let previous_schema_version = loaded_manifest.schema_version;
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = loaded_manifest.configuration_hash
             == expected_configuration
@@ -89,7 +88,9 @@ impl AssetPipeline {
             .clone()
             .unwrap_or_else(|| staging_path(&config.output_dir));
         fs::create_dir_all(staging.join("vfs"))?;
-        invalidate_staged_mesh_outputs(&staging, previous_schema_version)?;
+        if resumed {
+            invalidate_staged_mesh_outputs(&staging)?;
+        }
         let run_result = Self::run_into(&config, &staging, &previous_manifest, &progress_tx).await;
         let mut report = match run_result {
             Ok(report) => report,
@@ -1056,11 +1057,7 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
         })
 }
 
-fn invalidate_staged_mesh_outputs(staging: &Path, previous_schema_version: u32) -> Result<()> {
-    if !matches!(previous_schema_version, 12..=14) || crate::cache::CONVERTER_SCHEMA_VERSION != 15 {
-        return Ok(());
-    }
-
+fn invalidate_staged_mesh_outputs(staging: &Path) -> Result<()> {
     let vfs = staging.join("vfs");
     for entry in WalkDir::new(staging)
         .into_iter()
@@ -1150,15 +1147,18 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_keeps_staged_meshes() {
+    fn invalidates_unversioned_staged_meshes_but_preserves_vfs() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path();
         fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::create_dir_all(staging.join("vfs/meshes")).unwrap();
         fs::write(staging.join("meshes/resumable.glb"), b"mesh").unwrap();
+        fs::write(staging.join("vfs/meshes/source.glb"), b"source").unwrap();
 
-        invalidate_staged_mesh_outputs(staging, crate::cache::CONVERTER_SCHEMA_VERSION).unwrap();
+        invalidate_staged_mesh_outputs(staging).unwrap();
 
-        assert!(staging.join("meshes/resumable.glb").is_file());
+        assert!(!staging.join("meshes/resumable.glb").exists());
+        assert!(staging.join("vfs/meshes/source.glb").is_file());
     }
 
     #[test]
@@ -1262,33 +1262,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_15_migration_does_not_publish_schema_14_staged_meshes() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        let staging = temp.path().join("modern.staging-resume");
-        fs::create_dir_all(&data).unwrap();
-        fs::create_dir_all(&output).unwrap();
-        fs::create_dir_all(staging.join("meshes")).unwrap();
-        fs::write(staging.join("meshes/stale.glb"), b"schema 14 mesh").unwrap();
-        fs::write(
-            output.join("conversion-manifest.json"),
-            br#"{"schema_version":14,"complete":true,"configuration_hash":"","entries":{}}"#,
-        )
-        .unwrap();
+    async fn resume_does_not_publish_unverified_staged_meshes_for_any_manifest_schema() {
+        let manifests = [
+            ("absent", None),
+            (
+                "schema-14",
+                Some(
+                    br#"{"schema_version":14,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+            (
+                "schema-15",
+                Some(
+                    br#"{"schema_version":15,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+        ];
 
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let report = run_without_progress(config).await;
+        for (name, manifest) in manifests {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("Data");
+            let output = temp.path().join("modern");
+            let staging = temp.path().join("modern.staging-resume");
+            fs::create_dir_all(&data).unwrap();
+            fs::create_dir_all(&output).unwrap();
+            fs::create_dir_all(staging.join("meshes")).unwrap();
+            fs::write(staging.join("meshes/stale.glb"), b"unverified mesh").unwrap();
+            if let Some(manifest) = manifest {
+                fs::write(output.join("conversion-manifest.json"), manifest).unwrap();
+            }
 
-        assert!(report.complete);
-        assert!(!output.join("meshes/stale.glb").exists());
-        assert_eq!(
-            ConversionManifest::load(&output.join("conversion-manifest.json"))
-                .unwrap()
-                .schema_version,
-            crate::cache::CONVERTER_SCHEMA_VERSION
-        );
+            let mut config = PipelineConfig::new(&data, &output);
+            config.resume_staging = Some(staging);
+            let report = run_without_progress(config).await;
+
+            assert!(report.complete, "resume failed with {name} manifest");
+            assert!(
+                !output.join("meshes/stale.glb").exists(),
+                "stale mesh published with {name} manifest"
+            );
+            assert_eq!(
+                ConversionManifest::load(&output.join("conversion-manifest.json"))
+                    .unwrap()
+                    .schema_version,
+                crate::cache::CONVERTER_SCHEMA_VERSION
+            );
+        }
     }
 
     #[tokio::test]
