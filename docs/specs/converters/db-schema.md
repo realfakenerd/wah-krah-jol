@@ -8,6 +8,11 @@ This specification details the canonical DDL schema, tables, indices, and column
 
 `skyrim_world.db` is built by `crates/converter` by parsing master files (`Skyrim.esm`) and plugin files (`.esp`/`.esl`) in priority load order defined by `plugins.txt`.
 
+The database stamps its own version in `schema_info`; the current one is **4**
+(`shared::WORLD_DATABASE_SCHEMA_VERSION`), which added the `lights` table and
+`references.radius_override`. The runtime refuses an asset set stamped with any
+other version.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                      `skyrim_world.db` Implemented Schema                   │
@@ -113,6 +118,7 @@ CREATE TABLE IF NOT EXISTS references (
     rot_y REAL NOT NULL,                -- Rotation Y (Radians)
     rot_z REAL NOT NULL,                -- Rotation Z (Radians)
     scale REAL NOT NULL DEFAULT 1.0,    -- Scale multiplier
+    radius_override REAL,               -- XRDS radius in Creation units (NULL when the REFR has none)
     data BLOB                           -- Subrecords payload
 );
 
@@ -213,5 +219,34 @@ CREATE TABLE IF NOT EXISTS conversion_cache (
     plugin_path TEXT PRIMARY KEY,
     file_hash BLOB NOT NULL,
     last_converted INTEGER NOT NULL
+);
+```
+
+---
+
+### 12. Point Light Sources (`lights`)
+
+One row per `LIGH` base record: radius, colour, flags, falloff exponent and the
+optional `FNAM` fade, which is what the runtime places a point light from. The
+radius is a `DATA` `u32` in Creation units widened to a float, and the row is
+written whether or not the record has a `MODL`: an invisible light still lights
+the space, and most `LIGH` records in `Skyrim.esm` are invisible. A record whose
+`DATA` is missing or holds fewer than the 20 bytes these columns need gets no
+row rather than invented values, and a `LIGH` without a `MODL` gets no `statics`
+row either - there would be no mesh to draw.
+
+A reference that places a light usually carries its own `XRDS` radius, stored in
+`references.radius_override` (10,810 of the 12,148 `LIGH` references in
+`Skyrim.esm`), which overrides the base record's radius for that placement.
+
+```sql
+CREATE TABLE IF NOT EXISTS lights (
+    id INTEGER PRIMARY KEY,        -- LIGH FormID
+    editor_id TEXT,
+    radius REAL NOT NULL,          -- Creation units (DATA u32)
+    color_r INTEGER NOT NULL, color_g INTEGER NOT NULL, color_b INTEGER NOT NULL,
+    flags INTEGER NOT NULL,        -- DATA flags (dynamic, can carry, negative, flicker, off by default, ...)
+    falloff REAL NOT NULL,
+    fade REAL                      -- FNAM, if present
 );
 ```

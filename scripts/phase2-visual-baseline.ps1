@@ -43,10 +43,10 @@ try {
     }
     $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
     if ($manifest.complete -ne $true) { throw "conversion-manifest.json is not complete" }
-    if ($manifest.schema_version -ne 12) { throw "conversion-manifest.json schema must be 12" }
+    if ($manifest.schema_version -ne 14) { throw "conversion-manifest.json schema must be 14" }
     $integration = Get-Content -LiteralPath (Join-Path $resolvedAssets "integration-report.json") -Raw | ConvertFrom-Json
     if ($integration.passed -ne $true) { throw "integration-report.json did not pass" }
-    if ($integration.schema_version -ne 3) { throw "integration-report.json schema must be 3" }
+    if ($integration.schema_version -ne 4) { throw "integration-report.json schema must be 4" }
 
     if (-not $SkipBuild -or -not (Test-Path -LiteralPath $engine -PathType Leaf) -or -not (Test-Path -LiteralPath $inspector -PathType Leaf)) {
         & cargo build --release -p engine --bins -j1

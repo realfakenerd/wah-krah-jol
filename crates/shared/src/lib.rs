@@ -4,7 +4,7 @@ pub mod coordinates;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 4;
 pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 
