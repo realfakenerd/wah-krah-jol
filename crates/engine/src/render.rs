@@ -6,6 +6,7 @@ use bevy::{
     asset::embedded_asset,
     camera::{RenderTarget, visibility::RenderLayers},
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
+    image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::{
@@ -26,6 +27,14 @@ use std::sync::{
 
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
+
+fn repeating_terrain_sampler() -> ImageSampler {
+    ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::linear()
+    })
+}
 
 pub struct VercidiumRendererPlugin;
 
@@ -216,7 +225,12 @@ impl TerrainExtension {
                         terrain.cell_id, layer.texture_form_id
                     )
                 })?;
-            let handle = asset_server.load(path.to_owned());
+            let handle = asset_server
+                .load_builder()
+                .with_settings(|settings: &mut ImageLoaderSettings| {
+                    settings.sampler = repeating_terrain_sampler();
+                })
+                .load(path.to_owned());
             *target = Some(handle.clone());
             handles.push(handle);
         }
@@ -422,6 +436,19 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_sampler_repeats_with_linear_mip_filtering() {
+        let ImageSampler::Descriptor(sampler) = repeating_terrain_sampler() else {
+            panic!("terrain sampler must have a descriptor");
+        };
+        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
+        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
+        assert_eq!(sampler.mag_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.min_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.mipmap_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.anisotropy_clamp, 1);
+    }
 
     #[test]
     fn reflects_camera_above_and_below_the_water_plane() {
