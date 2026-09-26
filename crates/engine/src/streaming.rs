@@ -18,7 +18,7 @@ use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     gltf::GltfExtras,
-    image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
+    image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
     math::Affine3A,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
@@ -813,7 +813,12 @@ fn track_surface_readiness(
     metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
     let mut completed = 0usize;
     for (entity, pending) in &terrain {
-        match validate_surface_dependencies(&asset_server, &images, &pending.images, true) {
+        match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &pending.images,
+            SurfaceImageKind::Terrain,
+        ) {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
                 metrics.terrain_patches_validated =
@@ -850,7 +855,12 @@ fn track_surface_readiness(
     }
     for (entity, pending) in &water {
         let handles: Vec<_> = pending.flow_normal.iter().cloned().collect();
-        match validate_surface_dependencies(&asset_server, &images, &handles, false) {
+        match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &handles,
+            SurfaceImageKind::Water,
+        ) {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
                 metrics.water_surfaces_validated =
@@ -895,11 +905,26 @@ enum SurfaceDependencyState {
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
+enum SurfaceImageKind {
+    Terrain,
+    Water,
+}
+
+fn terrain_sampler_repeats(sampler: &ImageSampler) -> bool {
+    matches!(
+        sampler,
+        ImageSampler::Descriptor(descriptor)
+            if descriptor.address_mode_u == ImageAddressMode::Repeat
+                && descriptor.address_mode_v == ImageAddressMode::Repeat
+    )
+}
+
 fn validate_surface_dependencies(
     asset_server: &AssetServer,
     images: &Assets<Image>,
     handles: &[Handle<Image>],
-    expects_srgb: bool,
+    kind: SurfaceImageKind,
 ) -> SurfaceDependencyState {
     for handle in handles {
         if let Some((load, _, recursive)) = asset_server.get_load_states(handle.id()) {
@@ -918,7 +943,7 @@ fn validate_surface_dependencies(
         let Some(image) = images.get(handle) else {
             return SurfaceDependencyState::Pending;
         };
-        if image.texture_descriptor.format.is_srgb() != expects_srgb {
+        if image.texture_descriptor.format.is_srgb() != matches!(kind, SurfaceImageKind::Terrain) {
             return SurfaceDependencyState::Failed(format!(
                 "image {:?} has wrong color space {:?}",
                 handle.id(),
@@ -927,6 +952,12 @@ fn validate_surface_dependencies(
         }
         if let Err(reason) = validate_image_sampler("surface", &image.sampler) {
             return SurfaceDependencyState::Failed(reason);
+        }
+        if matches!(kind, SurfaceImageKind::Terrain) && !terrain_sampler_repeats(&image.sampler) {
+            return SurfaceDependencyState::Failed(format!(
+                "terrain image {:?} did not load with a repeating sampler",
+                handle.id()
+            ));
         }
     }
     SurfaceDependencyState::Ready
@@ -1851,6 +1882,19 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_sampler_check_rejects_default_and_clamped_images() {
+        assert!(!terrain_sampler_repeats(&ImageSampler::Default));
+        assert!(!terrain_sampler_repeats(&ImageSampler::linear()));
+        assert!(terrain_sampler_repeats(&ImageSampler::Descriptor(
+            bevy::image::ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                ..bevy::image::ImageSamplerDescriptor::linear()
+            }
+        )));
+    }
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
