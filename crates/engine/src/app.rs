@@ -1441,6 +1441,7 @@ fn capture_acceptance_screenshot(
     config: Res<EngineConfig>,
     mut state: Local<ScreenshotCaptureState>,
     streaming: Option<Res<StreamingMetrics>>,
+    world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
     windows: Query<(), With<Window>>,
 ) {
@@ -1460,22 +1461,9 @@ fn capture_acceptance_screenshot(
     {
         return;
     }
-    let assets_ready = streaming.as_deref().is_none_or(|metrics| {
-        metrics.pending_asset_instances == 0
-            && metrics.pending_surface_instances == 0
-            && metrics.loading_cells == 0
-            && metrics.resident_cells > 0
-            && metrics.asset_load_failures == 0
-            && metrics.material_validation_failures == 0
-            && metrics.transform_bounds_validation_failures == 0
-            && metrics.diagnostic_fallbacks == 0
-            && metrics.streaming_invariant_failures == 0
-            && metrics.streaming_fixture_failures == 0
-            && (!config.material_fixture || metrics.canonical_fixture_validated)
-            && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
-            && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
-            && (!config.streaming_fixture || metrics.streaming_fixture_validated)
-    });
+    let assets_ready = streaming
+        .as_deref()
+        .is_none_or(|metrics| screenshot_assets_ready(metrics, world_database.is_some(), &config));
     let renderer_ready = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     if !assets_ready || !renderer_ready {
@@ -1493,6 +1481,27 @@ fn capture_acceptance_screenshot(
     state.captured = true;
 }
 
+fn screenshot_assets_ready(
+    metrics: &StreamingMetrics,
+    world_streaming_active: bool,
+    config: &EngineConfig,
+) -> bool {
+    metrics.pending_asset_instances == 0
+        && metrics.pending_surface_instances == 0
+        && metrics.loading_cells == 0
+        && (!world_streaming_active || metrics.resident_cells > 0)
+        && metrics.asset_load_failures == 0
+        && metrics.material_validation_failures == 0
+        && metrics.transform_bounds_validation_failures == 0
+        && metrics.diagnostic_fallbacks == 0
+        && metrics.streaming_invariant_failures == 0
+        && metrics.streaming_fixture_failures == 0
+        && (!config.material_fixture || metrics.canonical_fixture_validated)
+        && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
+        && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
+        && (!config.streaming_fixture || metrics.streaming_fixture_validated)
+}
+
 #[derive(Default)]
 struct ScreenshotCaptureState {
     frames: u32,
@@ -1503,6 +1512,19 @@ struct ScreenshotCaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_readiness_requires_resident_cells_only_with_world_streaming() {
+        let metrics = StreamingMetrics::default();
+        let config = EngineConfig::default();
+
+        assert!(screenshot_assets_ready(&metrics, false, &config));
+        assert!(!screenshot_assets_ready(&metrics, true, &config));
+
+        let mut settled_metrics = metrics;
+        settled_metrics.resident_cells = 1;
+        assert!(screenshot_assets_ready(&settled_metrics, true, &config));
+    }
 
     #[test]
     fn automatic_flight_reverses_before_leaving_the_representative_world_area() {

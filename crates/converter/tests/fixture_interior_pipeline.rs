@@ -79,16 +79,10 @@ async fn generated_interior_plugin_converts_end_to_end() {
         .unwrap();
     assert_eq!(
         (references, statics),
-        (3, 1),
-        "one static placement, the door pair, and one static base record"
+        (3, 3),
+        "the static placement and both door bases are exported"
     );
 
-    // Both door references export without a model, and this count is the check
-    // that keeps it visible: the exporter fills `statics` from `STAT`, `MSTT`
-    // and `FURN` only, so a `DOOR` base record never lands there and a
-    // reference that places one has no model path. `world-inspect` reports the
-    // same references under `references_without_model`, and the doors' meshes
-    // never reach the GLB pipeline until the exporter handles `DOOR`.
     let references_without_model: i64 = connection
         .query_row(
             "SELECT count(*) FROM \"references\" r LEFT JOIN statics s ON s.id = r.base_form_id
@@ -98,7 +92,7 @@ async fn generated_interior_plugin_converts_end_to_end() {
         )
         .unwrap();
     assert_eq!(
-        references_without_model, 2,
-        "the door pair has no model in the exported world"
+        references_without_model, 0,
+        "the static and door references all resolve to exported models"
     );
 }

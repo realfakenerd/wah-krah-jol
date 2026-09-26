@@ -224,7 +224,7 @@ fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
     let x: f32 = parts.next()?.trim().parse().ok()?;
     let y: f32 = parts.next()?.trim().parse().ok()?;
     let z: f32 = parts.next()?.trim().parse().ok()?;
-    if parts.next().is_some() {
+    if parts.next().is_some() || !x.is_finite() || !y.is_finite() || !z.is_finite() {
         return None;
     }
     Some((x, y, z))
@@ -264,6 +264,20 @@ mod tests {
             EngineConfig::from_args(["--screenshot-camera-offset", "0,6000"].map(str::to_owned));
         assert_eq!(config.screenshot_camera_offset, None);
         assert_eq!(EngineConfig::default().screenshot_camera_offset, None);
+    }
+
+    #[test]
+    fn rejects_non_finite_screenshot_camera_offset_components() {
+        for invalid in [
+            "NaN,0,0",
+            "0,NaN,0",
+            "0,0,NaN",
+            "inf,0,0",
+            "0,-inf,0",
+            "0,0,Infinity",
+        ] {
+            assert_eq!(parse_offset(invalid), None, "{invalid}");
+        }
     }
 
     #[test]
