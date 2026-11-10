@@ -398,7 +398,12 @@ impl AssetPipeline {
         } else {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
-        let previous_manifest = reusable_manifest(&config, loaded_manifest)?;
+        let mut previous_manifest = reusable_manifest(&config, loaded_manifest)?;
+        if config.invalidate_cache {
+            // Invalidation forgets converted outputs, not the capabilities the published pack
+            // declared: the new pack must still say which of them it dropped.
+            previous_manifest.extensions = published_extensions(&config.output_dir);
+        }
         let staging = config
             .resume_staging
             .clone()
@@ -604,6 +609,7 @@ impl AssetPipeline {
             archives: Default::default(),
             entries: Default::default(),
             derived_outputs: Default::default(),
+            extensions: Vec::new(),
         };
         report.phase_elapsed_ms.insert(
             "conversion_initialization".into(),
@@ -1656,9 +1662,25 @@ impl AssetPipeline {
         .await;
         interrupt(cancellation)?;
         let manifest_save_started = Instant::now();
+        report.inputs_by_kind = manifest.inputs_by_kind.clone();
+        // The new pack starts without capability declarations, but the pack it replaces may have
+        // carried some. Offer each to the refresh: one whose payload is still valid in staging is
+        // kept and its files are published with the pack; every other one is dropped with a
+        // warning that is part of the report, so the completeness below accounts for it.
+        manifest.extensions = previous.extensions.clone();
+        report
+            .warnings
+            .extend(crate::extensions::refresh_manifest_with_notices(
+                &mut manifest,
+                staging,
+            )?);
+        for payload in crate::extensions::retained_payload_paths(&manifest, staging)? {
+            if !report.artifacts.contains(&payload) {
+                report.artifacts.push(payload);
+            }
+        }
         manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
-        report.inputs_by_kind = manifest.inputs_by_kind.clone();
         manifest.save(&staging.join("conversion-manifest.json"))?;
         report
             .artifacts
@@ -1668,6 +1690,23 @@ impl AssetPipeline {
             manifest_save_started.elapsed().as_millis(),
         );
         Ok(report)
+    }
+}
+
+/// The capability declarations of the published pack, for a run that ignores the rest of its
+/// manifest. An unreadable manifest is logged and treated as declaring nothing, because
+/// `--invalidate-cache` is also the way to recover from one.
+fn published_extensions(output: &Path) -> Vec<shared::extensions::ExtensionEntry> {
+    let path = output.join("conversion-manifest.json");
+    match ConversionManifest::load(&path) {
+        Ok(manifest) => manifest.extensions,
+        Err(error) => {
+            log::warn!(
+                "cannot read the capabilities declared by {}: {error:#}",
+                path.display()
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -10479,6 +10518,107 @@ mod tests {
         assert_eq!(
             archive_load_order_priority(Path::new("Standalone.bsa"), &plugins),
             None
+        );
+    }
+
+    const FOREIGN_PAYLOAD: &str = "optional-payload.bin";
+
+    /// Converts one script, then declares a foreign capability in the published manifest.
+    async fn pack_with_foreign_capability(
+        data: &Path,
+        output: &Path,
+    ) -> shared::extensions::ExtensionEntry {
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        AssetPipeline::run_async(cpu_lod_config(data, output), tx)
+            .await
+            .unwrap();
+        drain.await.unwrap();
+        let payload = b"foreign optional payload";
+        fs::write(output.join(FOREIGN_PAYLOAD), payload).unwrap();
+        let mut hasher = shared::extensions::ExtensionHasher::new("example.optional", 1);
+        hasher.add_file(FOREIGN_PAYLOAD, payload);
+        let entry = shared::extensions::ExtensionEntry {
+            id: "example.optional".into(),
+            version: 1,
+            owns: shared::extensions::ExtensionOwns {
+                files: vec![FOREIGN_PAYLOAD.into()],
+                ..Default::default()
+            },
+            sha256: hasher.finish(),
+            built_from: "earlier-core".into(),
+            stats: Default::default(),
+        };
+        let path = output.join("conversion-manifest.json");
+        let mut manifest = ConversionManifest::load(&path).unwrap();
+        manifest.extensions.push(entry.clone());
+        manifest.save(&path).unwrap();
+        entry
+    }
+
+    async fn convert_again(config: PipelineConfig) -> PipelineReport {
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let report = AssetPipeline::run_async(config, tx).await.unwrap();
+        drain.await.unwrap();
+        report
+    }
+
+    /// A new pack does not inherit another pack's capability payloads, but losing one must be
+    /// reported rather than silent, and the report must not claim a complete conversion.
+    #[tokio::test]
+    async fn conversion_reports_capabilities_the_new_pack_drops() {
+        for invalidate_cache in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("Data");
+            let output = temp.path().join("modern");
+            pack_with_foreign_capability(&data, &output).await;
+            let mut config = cpu_lod_config(&data, &output);
+            config.invalidate_cache = invalidate_cache;
+            let report = convert_again(config).await;
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("dropped capability example.optional")),
+                "invalidate_cache={invalidate_cache}: {:?}",
+                report.warnings
+            );
+            assert!(!report.complete, "invalidate_cache={invalidate_cache}");
+            let published =
+                ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+            assert!(!published.complete);
+            assert!(published.extensions.is_empty());
+        }
+    }
+
+    /// A staging tree that already holds a declared payload keeps the declaration, and the pack
+    /// is published with the payload files, never the declaration alone.
+    #[tokio::test]
+    async fn resumed_conversion_publishes_retained_capability_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        let entry = pack_with_foreign_capability(&data, &output).await;
+        let staging = temp.path().join("modern.staging-resume");
+        fs::create_dir_all(&staging).unwrap();
+        fs::copy(output.join(FOREIGN_PAYLOAD), staging.join(FOREIGN_PAYLOAD)).unwrap();
+        let mut config = cpu_lod_config(&data, &output);
+        config.resume_staging = Some(staging);
+        let report = convert_again(config).await;
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.complete);
+        let published = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert_eq!(published.extensions, vec![entry]);
+        assert_eq!(
+            fs::read(output.join(FOREIGN_PAYLOAD)).unwrap(),
+            b"foreign optional payload"
         );
     }
 

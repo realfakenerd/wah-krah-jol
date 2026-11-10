@@ -44,6 +44,9 @@ pub struct RepairReport {
     /// False also covers historical manifests without that proof.
     pub record_data_complete: bool,
     pub failures: BTreeMap<String, String>,
+    /// Optional capability declarations dropped because their payload is no longer valid.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -203,6 +206,7 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
         published: false,
         record_data_complete: manifest.record_data_complete == Some(true),
         failures: BTreeMap::new(),
+        warnings: Vec::new(),
     };
 
     let mut selection_notices = Vec::new();
@@ -663,6 +667,12 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
     }
     report.failures = manifest.failures.clone();
     manifest.complete = false;
+    report
+        .warnings
+        .extend(crate::extensions::refresh_manifest_with_notices(
+            &mut manifest,
+            &staged,
+        )?);
     manifest.save(&staged.join("conversion-manifest.json"))?;
     fs::write(
         directory.join("repair-report.json"),
@@ -1340,6 +1350,7 @@ mod tests {
                 published: false,
                 record_data_complete: false,
                 failures: BTreeMap::new(),
+                warnings: Vec::new(),
             };
             attempt(
                 &config,

@@ -10,6 +10,7 @@ pub mod collision;
 pub mod compose;
 pub mod config;
 pub mod esm;
+pub mod extensions;
 pub mod integration;
 pub mod lip;
 pub mod lod;

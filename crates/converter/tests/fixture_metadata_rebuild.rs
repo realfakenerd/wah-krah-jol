@@ -14,6 +14,77 @@ const VOLCANIC_GLB: &str = "meshes/landscape/grass/dlc02volcanicashgrass01.glb";
 const VOLCANIC_ORIGINAL: &str = "textures/landscape/grass/volcanicashgrass02_n.dds";
 const VOLCANIC_TARGET: &str = "textures/dlc02/landscape/grass/volcanicashgrass02_n.dds";
 
+/// A capability dropped during final refresh must affect both published completeness flags.
+#[tokio::test]
+async fn metadata_rebuild_completeness_includes_late_extension_warnings() {
+    use shared::extensions::{ExtensionEntry, ExtensionHasher, ExtensionOwns};
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let foreign_path = "optional-payload.bin";
+    let payload = b"source-owned optional payload";
+    fs::write(source.join(foreign_path), payload).unwrap();
+    let connection = Connection::open(source.join("skyrim_world.db")).unwrap();
+    let core: String = connection
+        .query_row(
+            "SELECT build_identity FROM lod_build WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let mut hasher = ExtensionHasher::new("example.optional", 1);
+    hasher.add_file(foreign_path, payload);
+    let manifest_path = source.join("conversion-manifest.json");
+    let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+    manifest.extensions.push(ExtensionEntry {
+        id: "example.optional".into(),
+        version: 1,
+        owns: ExtensionOwns {
+            files: vec![foreign_path.into()],
+            ..Default::default()
+        },
+        sha256: hasher.finish(),
+        built_from: core,
+        stats: Default::default(),
+    });
+    manifest.save(&manifest_path).unwrap();
+    let source_hash = hash_file(&manifest_path).unwrap();
+    let report = rebuild(&data, &source, &output).await.unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("example.optional")),
+        "late refresh warning was not exercised: {:?}",
+        report.warnings
+    );
+    assert!(
+        !report.complete,
+        "late extension warning must mark the report incomplete"
+    );
+    let published = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+    assert!(
+        !published.complete,
+        "manifest and report must agree after final refresh"
+    );
+    assert!(
+        !published
+            .extensions
+            .iter()
+            .any(|entry| entry.id == "example.optional")
+    );
+    assert_eq!(
+        hash_file(&manifest_path).unwrap(),
+        source_hash,
+        "rebuild must not modify the source manifest"
+    );
+    assert_eq!(fs::read(source.join(foreign_path)).unwrap(), payload);
+}
+
 /// Old complete packs can contain optional derived files and strays without output proofs.
 /// Omit only those files while publishing every verified neighboring asset unchanged.
 #[tokio::test]
