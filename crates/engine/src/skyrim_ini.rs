@@ -11,6 +11,7 @@
 //!
 //! | Section | Key | Engine setting |
 //! |---|---|---|
+//! | `[Sky]` | `fSunXExtreme`, `fSunYExtreme`, `fSunZExtreme`, `fSunDirXExtreme`, `fSunAlphaTransTime` | explicit sun-path overrides over GMST/fallback values |
 //! | `[General]` | `uGridsToLoad` | full-detail grid: `stream_radius = (uGridsToLoad - 1) / 2` |
 //! | `[Display]` | `fShadowDistance` | upper bound for sun shadow cascades, in Creation units |
 //! | `[TerrainManager]` | `fBlockLevel0Distance` | level-4 terrain LOD distance, before the multiplier |
@@ -100,6 +101,19 @@ impl SkyrimIni {
                 ),
             }
         }
+        for (index, key) in crate::sun::SUN_KEYS.into_iter().enumerate() {
+            let Some(raw) = self.get("Sky", key) else {
+                continue;
+            };
+            match raw.parse::<f32>() {
+                Ok(value) if crate::sun::SunSettings::valid(index, value) => {
+                    config.sun_settings_overrides[index] = Some(value)
+                }
+                _ => eprintln!(
+                    "warning: ignoring [Sky] {key}={raw:?}; unusable sun-path value, retaining GMST/fallback"
+                ),
+            }
+        }
         let lod = &mut config.terrain_lod;
         for (key, setting) in [
             ("fBlockLevel0Distance", &mut lod.block_level0_distance),
@@ -132,6 +146,30 @@ mod tests {
         let mut config = EngineConfig::default();
         ini.apply(&mut config);
         config
+    }
+
+    /// Explicit values layer by key; bad values cannot poison authored settings.
+    #[test]
+    fn sun_ini_overrides_validate_and_layer_without_aborting() {
+        let mut ini = SkyrimIni::default();
+        ini.merge_str("[sKy]\nfSunXExtreme=-300\nfSunYExtreme=-70\nfSunZExtreme=-120\nfSunDirXExtreme=0\nfSunAlphaTransTime=1.5\n");
+        ini.merge_str("[Sky]\nfSunYExtreme=80\n");
+        let mut config = EngineConfig::default();
+        ini.apply(&mut config);
+        assert_eq!(
+            config.sun_settings_overrides,
+            [Some(-300.0), Some(80.0), Some(-120.0), Some(0.0), Some(1.5)]
+        );
+        for (key, value) in [
+            ("fSunXExtreme", "0"),
+            ("fSunYExtreme", "NaN"),
+            ("fSunZExtreme", "inf"),
+            ("fSunDirXExtreme", "bad"),
+            ("fSunAlphaTransTime", "24"),
+        ] {
+            let config = apply(&format!("[Sky]\n{key}={value}\n"));
+            assert_eq!(config.sun_settings_overrides, [None; 5]);
+        }
     }
 
     #[test]

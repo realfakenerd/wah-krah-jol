@@ -3,8 +3,8 @@
 //! The converter publishes the environment tables documented in db-schema.md ("Cell and
 //! Worldspace Environment", "Weather, Climate, Image Space and Lighting Templates"). They are
 //! optional: a database converted before them, or with a table of another shape, loads an empty
-//! map for that table and the engine keeps its built-in lighting. Nothing renders from this
-//! catalog yet; it is the reader later lighting and sky work consumes (#264).
+//! map for that table and the engine keeps its built-in lighting. The clock/climate sun path
+//! consumes this catalog; other lighting and sky work can consume the remaining fields (#264).
 
 use bevy::prelude::*;
 use rusqlite::{Connection, OpenFlags, Row};
@@ -156,6 +156,9 @@ pub struct EnvironmentCatalog {
     weathers: HashMap<u32, Weather>,
     image_spaces: HashMap<u32, ImageSpace>,
     climate_weathers: HashMap<u32, Vec<ClimateWeather>>,
+    sun_timings: HashMap<u32, crate::sun::SunTiming>,
+    parent_worlds: HashMap<u32, u32>,
+    sun_settings: crate::sun::SunSettings,
 }
 
 /// A directional ambient block's 22 columns after `prefix`.
@@ -242,6 +245,7 @@ impl EnvironmentCatalog {
         Ok(Self::from_connection(&connection))
     }
 
+    /// Load optional authored tables and sun game settings without requiring a complete pack.
     pub fn from_connection(connection: &Connection) -> Self {
         let cells = read(
             connection,
@@ -330,6 +334,14 @@ impl EnvironmentCatalog {
                 ))
             },
         );
+        let parent_worlds = read(
+            connection,
+            "SELECT id, parent_world FROM worldspaces WHERE parent_world IS NOT NULL",
+            "worldspaces",
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        let sun_timings = read_sun_timings(connection);
+        let sun_settings = read_sun_settings(connection);
         let weathers = read_weathers(connection);
         let mut climate_weathers: HashMap<u32, Vec<ClimateWeather>> = HashMap::new();
         for (climate, entry) in read_rows(
@@ -367,6 +379,9 @@ impl EnvironmentCatalog {
             weathers,
             image_spaces,
             climate_weathers,
+            sun_timings,
+            parent_worlds,
+            sun_settings,
         }
     }
 
@@ -391,12 +406,134 @@ impl EnvironmentCatalog {
         self.image_spaces.get(&id)
     }
 
+    /// Resolve WRLD PNAM bit 0x10 (use parent's climate). Missing parents or cycles return None.
+    /// The catalog size bounds traversal without allocating a visited set each frame.
+    pub fn worldspace_climate(&self, mut worldspace: u32) -> Option<u32> {
+        for _ in 0..=self.worldspaces.len() {
+            let environment = self.worldspaces.get(&worldspace)?;
+            if environment.parent_flags.unwrap_or(0) & 0x10 == 0 {
+                return environment.climate;
+            }
+            worldspace = *self.parent_worlds.get(&worldspace)?;
+        }
+        None
+    }
+
+    /// Authored TNAM in ten-minute units, absent for incomplete or invalid climates.
+    pub fn sun_timing(&self, climate_id: u32) -> Option<crate::sun::SunTiming> {
+        self.sun_timings.get(&climate_id).copied()
+    }
+
+    /// Winning optional GMST sun settings with per-key fallback.
+    pub fn sun_settings(&self) -> crate::sun::SunSettings {
+        self.sun_settings
+    }
+
     /// A climate's weather list in authored order; empty when unknown.
     pub fn climate_weathers(&self, climate_id: u32) -> &[ClimateWeather] {
         self.climate_weathers
             .get(&climate_id)
             .map_or(&[], Vec::as_slice)
     }
+}
+
+/// Retain good climate rows when one optional TNAM row is incomplete or malformed.
+fn read_sun_timings(connection: &Connection) -> HashMap<u32, crate::sun::SunTiming> {
+    let mut timings = HashMap::new();
+    let Ok(mut query) = connection
+        .prepare("SELECT id, sunrise_begin, sunrise_end, sunset_begin, sunset_end FROM climates")
+    else {
+        return timings;
+    };
+    let Ok(rows) = query.query_map([], |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            [
+                row.get::<_, u8>(1)?,
+                row.get::<_, u8>(2)?,
+                row.get::<_, u8>(3)?,
+                row.get::<_, u8>(4)?,
+            ],
+        ))
+    }) else {
+        return timings;
+    };
+    let mut invalid = 0;
+    for row in rows {
+        match row {
+            Ok((id, values)) if crate::sun::SunTiming(values).valid() => {
+                timings.insert(id, crate::sun::SunTiming(values));
+            }
+            _ => invalid += 1,
+        }
+    }
+    if invalid > 0 {
+        eprintln!(
+            "warning: environment: ignored {invalid} unusable climate sun timings; using fallback for those climates"
+        );
+    }
+    timings
+}
+
+/// Read winning canonical GMST payloads already published by the converter. A corrupt optional
+/// record must not discard valid neighbors, and missing tables retain the fallback settings.
+fn read_sun_settings(connection: &Connection) -> crate::sun::SunSettings {
+    let mut settings = crate::sun::SunSettings::default();
+    let Ok(mut query) = connection
+        .prepare("SELECT data FROM records WHERE record_type='GMST' ORDER BY load_order, form_id")
+    else {
+        return settings;
+    };
+    let Ok(rows) = query.query_map([], |row| row.get::<_, Vec<u8>>(0)) else {
+        return settings;
+    };
+    let mut invalid = 0;
+    for row in rows {
+        let Ok(bytes) = row else {
+            invalid += 1;
+            continue;
+        };
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(&bytes);
+        let Ok(record) =
+            rkyv::from_bytes::<shared::records::ArchivedRecordData, rkyv::rancor::Error>(&aligned)
+        else {
+            invalid += 1;
+            continue;
+        };
+        let mut edids = record.subrecords.iter().filter(|sub| sub.tag == *b"EDID");
+        let Some(edid) = edids.next() else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(&edid.data) else {
+            continue;
+        };
+        let Some(index) = crate::sun::SUN_KEYS
+            .iter()
+            .position(|key| key.eq_ignore_ascii_case(name.trim_end_matches('\0')))
+        else {
+            continue;
+        };
+        let mut blocks = record.subrecords.iter().filter(|sub| sub.tag == *b"DATA");
+        let value = blocks
+            .next()
+            .and_then(|sub| <[u8; 4]>::try_from(sub.data.as_slice()).ok())
+            .map(f32::from_le_bytes);
+        if edids.next().is_none()
+            && blocks.next().is_none()
+            && let Some(value) = value.filter(|v| crate::sun::SunSettings::valid(index, *v))
+        {
+            settings.0[index] = value;
+        } else {
+            invalid += 1;
+        }
+    }
+    if invalid > 0 {
+        eprintln!(
+            "warning: environment: ignored {invalid} unusable optional GMST sun inputs; retaining valid settings/fallbacks"
+        );
+    }
+    settings
 }
 
 fn read_weathers(connection: &Connection) -> HashMap<u32, Weather> {
@@ -497,6 +634,51 @@ fn read_rows<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child uses the parent climate only when PNAM requests it; cycles are safely absent.
+    #[test]
+    fn sun_climate_respects_parent_flags_and_bounds_cycles() {
+        let connection = Connection::open_in_memory().unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        connection.execute_batch("INSERT INTO worldspaces(id,editor_id,parent_world,flags) VALUES (100,'parent',NULL,0),(101,'inherit',100,0),(102,'own',100,0),(103,'cycle',103,0),(104,'missing',999,0);
+            INSERT INTO worldspace_environment(worldspace_id,parent_flags,climate_id) VALUES (100,0,123),(101,16,456),(102,0,456),(103,16,123),(104,16,123);").unwrap();
+        let catalog = EnvironmentCatalog::from_connection(&connection);
+        assert_eq!(catalog.worldspace_climate(101), Some(123));
+        assert_eq!(catalog.worldspace_climate(102), Some(456));
+        assert_eq!(catalog.worldspace_climate(103), None);
+        assert_eq!(catalog.worldspace_climate(104), None);
+        assert_eq!(catalog.worldspace_climate(999), None);
+    }
+
+    /// Synthetic optional records are read independently; malformed neighbors preserve good data.
+    #[test]
+    fn sun_catalog_reads_winning_settings_and_retains_valid_neighbors() {
+        let connection = Connection::open_in_memory().unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        connection.execute_batch("INSERT INTO climates(id,sunrise_begin,sunrise_end,sunset_begin,sunset_end) VALUES (123,18,42,108,132),(456,200,1,2,3),(789,NULL,NULL,NULL,NULL);").unwrap();
+        for (id, name, value) in [
+            (1, "fSunYExtreme", 40.0_f32),
+            (2, "fSunZExtreme", -150.0),
+            (3, "fSunDirXExtreme", 200.0),
+            (4, "fSunAlphaTransTime", 0.5),
+            (5, "fSunXExtreme", 0.0),
+        ] {
+            let bytes = converter::esm::extractors::serialize_subrecords(&[
+                (b"EDID".to_vec(), format!("{name}\0").into_bytes()),
+                (b"DATA".to_vec(), value.to_le_bytes().to_vec()),
+            ]);
+            connection.execute("INSERT INTO records(form_id,record_type,load_order,data) VALUES(?1,'GMST',0,?2)",rusqlite::params![id,bytes]).unwrap();
+        }
+        connection.execute("INSERT INTO records(form_id,record_type,load_order,data) VALUES(6,'GMST',0,X'010203')",[]).unwrap();
+        let catalog = EnvironmentCatalog::from_connection(&connection);
+        assert_eq!(
+            catalog.sun_timing(123),
+            Some(crate::sun::SunTiming([18, 42, 108, 132]))
+        );
+        assert_eq!(catalog.sun_timing(456), None);
+        assert_eq!(catalog.sun_timing(789), None);
+        assert_eq!(catalog.sun_settings().0, [400.0, 40.0, -150.0, 200.0, 0.5]);
+    }
 
     #[test]
     fn a_database_without_the_tables_gives_an_empty_catalog() {

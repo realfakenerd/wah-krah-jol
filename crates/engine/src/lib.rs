@@ -47,6 +47,7 @@ pub mod streaming;
 mod streaming_gpu_metrics;
 mod streaming_preparation;
 mod streaming_trace;
+pub mod sun;
 pub mod swap_bridge;
 pub mod terrain_merge;
 pub mod terrain_upload;

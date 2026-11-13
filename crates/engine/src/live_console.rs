@@ -275,8 +275,10 @@ mod tests {
         world
     }
 
+    /// Synthetic captured-frame receipt used by console regression tests.
     fn captured_frame() -> CaptureFrame {
         CaptureFrame {
+            sun: None,
             main_frame: 42,
             render_frame: 41,
             camera_creation: [21750.0, -44530.0, 140.0],

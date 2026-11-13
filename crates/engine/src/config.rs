@@ -86,6 +86,12 @@ pub struct EngineConfig {
     pub sun_shadow_distance_limit: Option<f32>,
     /// Optional sun bearing clockwise from north and elevation above the horizon, in degrees.
     pub sun_position: Option<(f32, f32)>,
+    /// Initial game hour; deterministic captures freeze at this hour.
+    pub game_hour: f64,
+    /// Game seconds per real second during ordinary play; zero freezes the clock.
+    pub timescale: f64,
+    /// Explicit `[Sky]` overrides in `sun::SUN_KEYS` order; absent keys retain winning GMST values.
+    pub sun_settings_overrides: [Option<f32>; 5],
     pub terrain_lod: TerrainLodDistances,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
@@ -232,6 +238,9 @@ impl Default for EngineConfig {
             unload_radius: 3,
             sun_shadow_distance_limit: None,
             sun_position: None,
+            game_hour: 12.0,
+            timescale: 20.0,
+            sun_settings_overrides: [None; 5],
             terrain_lod: TerrainLodDistances::default(),
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
@@ -405,6 +414,8 @@ Benchmark and profiling:
   --image-space-weather <FormID>       select an authored WTHR image-space slot, not live weather
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
+  --game-hour <hour>                   initial hour, 0 <= hour < 24 (default 12; captures freeze)
+  --timescale <scale>                  game seconds per real second (default 20; 0 freezes)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
@@ -1247,6 +1258,12 @@ impl EngineConfig {
                         )
                     })?;
                 }
+                "--game-hour" => {
+                    config.game_hour = take_clock_value("--game-hour", args.next())?;
+                }
+                "--timescale" => {
+                    config.timescale = take_clock_value("--timescale", args.next())?;
+                }
                 "--sun-position" => {
                     let raw = take_raw("--sun-position", SUN_POSITION_EXPECTED, args.next())?;
                     config.sun_position = Some(parse_sun_position(&raw).ok_or_else(|| {
@@ -1591,6 +1608,29 @@ where
     accepted.ok_or_else(|| ConfigError::invalid_value(option, Some(raw), expected))
 }
 
+/// Parse the two clock controls with finite ranges while keeping each CLI match arm discoverable.
+fn take_clock_value(option: &'static str, value: Option<String>) -> Result<f64, ConfigError> {
+    let raw = take_raw(option, "a finite nonnegative number", value)?;
+    raw.parse::<f64>()
+        .ok()
+        .filter(|v| {
+            v.is_finite()
+                && *v >= 0.0
+                && if option == "--game-hour" {
+                    *v < 24.0
+                } else {
+                    *v <= 1_000_000.0
+                }
+        })
+        .ok_or_else(|| {
+            ConfigError::invalid_value(
+                option,
+                Some(raw),
+                "hour in [0,24), or timescale in [0,1000000]",
+            )
+        })
+}
+
 /// The option `argument` most likely meant, if it is within two edits of one.
 /// Ties go to the first option the help text lists.
 ///
@@ -1857,6 +1897,22 @@ mod tests {
     fn leading_quoted(line: &str) -> Option<(&str, &str)> {
         let (option, rest) = line.trim().strip_prefix('"')?.split_once('"')?;
         Some((option, rest))
+    }
+
+    /// Clock options validate finite ranges rather than admitting nonfinite runtime state.
+    #[test]
+    fn sun_clock_options_validate_hour_and_timescale() {
+        let config = run_config(&["--game-hour", "9.25", "--timescale", "0"]);
+        assert_eq!((config.game_hour, config.timescale), (9.25, 0.0));
+        for (key, value) in [
+            ("--game-hour", "24"),
+            ("--game-hour", "-1"),
+            ("--game-hour", "NaN"),
+            ("--timescale", "inf"),
+            ("--timescale", "-1"),
+        ] {
+            assert!(EngineConfig::from_args([key.to_string(), value.to_string()]).is_err());
+        }
     }
 
     #[test]

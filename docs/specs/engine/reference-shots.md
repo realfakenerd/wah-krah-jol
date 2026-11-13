@@ -100,3 +100,30 @@ visible in a campaign report instead of being read as a pass.
 `--headless` is ignored during a shots run, because the shots runner requires the render loop. `--shots`
 cannot be combined with a benchmark, `--acceptance-screenshot`, `--auto-fly-speed` or a fixture.
 `--run-label` names the run in the window title (`Mudcrab - shots: <label>`).
+
+## Game clock and sun direction
+
+`--game-hour <hour>` starts the game clock at a finite hour in `[0,24)` (default 12).
+Ordinary play advances at `--timescale <scale>` game seconds per real second (default 20;
+0 freezes). Shots, acceptance screenshots, benchmarks and matched routes freeze at the launch
+hour regardless of timescale, so streaming duration cannot move shadows between captures.
+
+The directional light follows the active worldspace's climate TNAM sunrise/sunset midpoints
+(including PNAM-requested parent climate inheritance),
+expanded by half `fSunAlphaTransTime`. A parameter sweeps from +1 to -1 across this day window
+and returns overnight. The normalized Creation-space toward-sun vector is
+`(parameter * fSunDirXExtreme, fSunYExtreme * fSunDirXExtreme / fSunXExtreme, -fSunZExtreme)`;
+engine axes map it to `(x,z,-y)`. This geometry follows spud (MIT, chasmlol/spud, e5f2de4);
+it is distinct from the visible sun-disc path.
+
+Winning canonical GMST records supply those five values. Optional `[Sky]` keys of the same names
+in `--ini` files override them individually. Missing inputs use fallback values
+400 / 25 / -100 / 400 / 2, and a symmetric 06:00/18:00 day without usable climate timing.
+Invalid record/INI fields warn and retain valid neighbors or fallbacks. TNAM bytes are ten-minute
+units; ordered same-day transitions are supported. A fade that would consume a full day uses
+the unexpanded climate midpoints. `--sun-position` remains a fixed explicit bearing/elevation
+override. Capture-frame receipts include the actual clock and engine-space toward-sun vector.
+
+This step changes direction only. Existing constant clear-day light intensity and palette remain
+at night while the X parameter returns; no moon light, astronomical orbit, weather selection,
+seasonal path or night palette is introduced.
