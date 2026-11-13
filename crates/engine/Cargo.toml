@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 collision-measure = []
+# Opt-in Tracy zones: Bevy's per-system spans plus `perf_span!`. See docs/contributing/native-profiling.md.
+tracy = ["bevy/trace_tracy"]
 
 [dependencies]
 shared = { path = "../shared" }

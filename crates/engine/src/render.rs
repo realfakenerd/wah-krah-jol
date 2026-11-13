@@ -875,6 +875,7 @@ fn update_water_reflection_camera(
     mut profiler: ResMut<ProfilingState>,
     settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
+    crate::perf_span::perf_span!("render/water_reflection_camera");
     let started = std::time::Instant::now();
     let (
         Ok((main, frustum, projection, exposure)),

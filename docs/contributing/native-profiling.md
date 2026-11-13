@@ -188,6 +188,30 @@ See [measurement validity and optional draw counters](../research/profiling-meas
 for diagnostic timestamps, GPU validity and completed-frame submission counts, and
 [the resulting fixes](../research/metal-performance-fixes-20261008.md) for implementation and validation.
 
+## See which system or render pass is slow (Tracy)
+
+Engine spans and Samply say a frame is slow and where its CPU time goes by stage. For one zone per
+Bevy system, with the engine's own phases nested inside, build with the opt-in `tracy` feature:
+
+```bash
+cargo run --profile quick -p engine --features tracy
+```
+
+Then start the Tracy profiler GUI and connect. The build bundles **Tracy 0.14.0**
+(`tracy-client` 0.18.5 in `Cargo.lock`); the GUI must be the same 0.14 release or it refuses the
+connection. Bevy's own system and schedule zones appear without further setup. `perf_span!("name")`
+(`crates/engine/src/perf_span.rs`) adds a zone for the rest of the enclosing block and compiles to
+nothing without the feature. Reuse the names the profiling report already records, such as
+`streaming/plan_cells`, and keep zones out of per-entity loops: a zone per entity changes the frame
+it measures.
+
+- A Tracy capture never gives a number to quote. The profiler slows the engine. Take frame times
+  and percentiles from an unprofiled run, as above.
+- Only Linux has been tried so far; Windows and macOS are untested. On macOS, Metal System Trace
+  (see above) remains the tool for GPU timelines.
+- RenderDoc (Windows, Linux) and PIX (Windows) need no engine support: launch or attach to the
+  engine, capture one frame of a settled scene, and inspect its draws and passes.
+
 ## Check mesh preparation and missing terrain
 
 CPU selection counts and successful upload acknowledgments do not prove that every surface reached

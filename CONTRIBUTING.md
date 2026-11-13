@@ -96,6 +96,9 @@ cargo build --profile quick --bin engine
 The binary lands in `target/quick/`. Use `--release` for anything you measure (benchmarks,
 acceptance runs), since `quick` frame times are not comparable.
 
+To see which system or render pass makes a frame slow, see the opt-in Tracy build in
+[`docs/contributing/native-profiling.md`](docs/contributing/native-profiling.md).
+
 ## 🛠️ Development Workflow
 
 The full path from idea to merge (checking for overlap, claiming an issue, drafts, review, merging) is in [`docs/contributing/workflow.md`](docs/contributing/workflow.md). The short version:

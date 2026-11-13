@@ -62,5 +62,7 @@ mod mesh_residency_audit;
 #[doc(hidden)]
 pub mod collision_measure;
 
+mod perf_span;
+
 #[cfg(feature = "collision-measure")]
 mod scene_placement_probe;
