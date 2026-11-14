@@ -12,11 +12,18 @@ reviews:
   poem: false
   review_status: true
   collapse_walkthrough: false
+  # Large upstream crate copies. Their local patches are listed in each copy's README and are
+  # best reviewed against the published source; vendor/project-wormhole-nif stays reviewed.
+  path_filters:
+    - "!vendor/bevy_*/**"
+    - "!vendor/meshoptimizer/**"
   auto_review:
     enabled: true
     drafts: false
     base_branches:
       - "main"
+      # Stacked PRs target the PR below them on a stack/ branch.
+      - "^stack/"
   tools:
     shellcheck:
       enabled: true
