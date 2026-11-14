@@ -209,9 +209,13 @@ pub struct StreamingWorld {
     /// Keep each dispatched payload accounted for after its cell leaves the wanted window.
     /// An entry survives channel delivery and deferral until the response is consumed.
     outstanding_cells: HashMap<CellKey, u64>,
-    /// The exterior grid square `plan_cells` measured this frame's window against, or `None` when
-    /// it had no camera to plan from. The lifecycle check compares against it to tell a root the
-    /// planner kept from one that only looks out of range because the camera moved since.
+    /// The exterior grid square [`plan_cells`] last measured the window against, or `None` when it
+    /// had no camera to plan from. The lifecycle check measures against this square rather than
+    /// re-reading the camera: the camera writers are not ordered against the streaming chain, so
+    /// the camera can cross into another cell after the planner ran and before the check runs, and
+    /// a check that re-read it would judge the window by a centre the planner has not seen yet
+    /// (Mudcrab #217). It is a global grid square, so an origin rebase between the two leaves it
+    /// valid.
     planned_center: Option<IVec2>,
     /// Responses for exterior cells with terrain that arrived while the merged terrain arrays were
     /// still loading, in arrival order. They are replayed, ahead of new responses, once the merged
@@ -564,9 +568,11 @@ pub struct StreamingMetrics {
     pub missing_cell_roots: u64,
     pub out_of_range_cell_roots: u64,
     /// Peak count of the roots `out_of_range_cell_roots` would count if it measured against the
-    /// centre `plan_cells` used instead of the camera read at check time. Diagnostic only: it is
-    /// not part of `streaming_invariant_failures` and gates nothing.
-    pub out_of_range_vs_planned_roots: u64,
+    /// camera read at check time instead of the centre `plan_cells` used. Diagnostic only: it is
+    /// not part of `streaming_invariant_failures` and gates nothing. It exceeds
+    /// `out_of_range_cell_roots` only when a camera writer moved the camera between the planner and
+    /// the check, so a gap between the two is plan drift and an equal pair is agreement.
+    pub out_of_range_vs_camera_roots: u64,
     /// Largest per-axis distance, in cells, between the planner's centre and the check's centre.
     pub max_plan_check_center_offset: i32,
     /// Lifecycle checks that ran without a centre from `plan_cells` because it had no camera.
@@ -5188,6 +5194,8 @@ fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
+    // The camera is read only to classify drift against the plan; the violation itself is judged
+    // against `StreamingWorld::planned_center`, so a mid-frame crossing cannot fail the check.
     camera: Query<&Transform, With<StreamingCamera>>,
     roots: Query<(Entity, &CellRef, Option<&ExteriorCellGrid>), With<StreamedCellRoot>>,
     static_colliders: Query<(), With<StaticColliderSource>>,
@@ -5232,11 +5240,18 @@ fn validate_streaming_lifecycle(
     let current_center =
         camera_translation.map(|translation| window_center(&config, translation, origin.0));
     let planned_center = streaming.planned_center;
-    let out_of_range_roots = current_center.map_or(0, |center| {
+    // Judged against the centre the planner retired cells by this frame, not the camera's square
+    // now: a camera that crossed a cell after `plan_cells` ran is the next frame's plan, and its
+    // trailing cells are retired then. A resident root outside the planned window is still a
+    // violation, whatever the camera did. With no plan this frame there is no window to check.
+    let out_of_range_roots = planned_center.map_or(0, |center| {
         roots_outside_window(&root_entries, &retiring_entities, center, unload_radius).count()
             as u64
     });
-    let out_of_range_vs_planned = planned_center.map_or(0, |center| {
+    // The same roots measured against the camera's square. It exceeds the violation count only when
+    // a camera writer moved the camera after the planner ran, which is drift rather than a leak;
+    // equal counts mean the camera still agrees with the plan.
+    let out_of_range_vs_camera = current_center.map_or(0, |center| {
         roots_outside_window(&root_entries, &retiring_entities, center, unload_radius).count()
             as u64
     });
@@ -5253,9 +5268,9 @@ fn validate_streaming_lifecycle(
     metrics.orphaned_cell_roots = metrics.orphaned_cell_roots.max(orphaned_roots);
     metrics.missing_cell_roots = metrics.missing_cell_roots.max(missing_roots);
     metrics.out_of_range_cell_roots = metrics.out_of_range_cell_roots.max(out_of_range_roots);
-    metrics.out_of_range_vs_planned_roots = metrics
-        .out_of_range_vs_planned_roots
-        .max(out_of_range_vs_planned);
+    metrics.out_of_range_vs_camera_roots = metrics
+        .out_of_range_vs_camera_roots
+        .max(out_of_range_vs_camera);
     if let Some(offset) = plan_check_offset {
         metrics.max_plan_check_center_offset = metrics
             .max_plan_check_center_offset
@@ -5266,9 +5281,9 @@ fn validate_streaming_lifecycle(
             metrics.invariant_checks_without_plan.saturating_add(1);
     }
     if violations > metrics.streaming_invariant_failures {
-        // The first offending roots measured against the check-time centre, each with its
-        // distance from both centres: one trailing column is drift, scattered cells are a leak.
-        let sample: Vec<_> = current_center
+        // The first offending roots measured against the planned centre, each with its distance
+        // from both centres: one trailing column is drift, scattered cells are a leak.
+        let sample: Vec<_> = planned_center
             .map(|center| {
                 roots_outside_window(&root_entries, &retiring_entities, center, unload_radius)
                     .take(8)
@@ -5276,7 +5291,7 @@ fn validate_streaming_lifecycle(
                         (
                             grid,
                             (grid - center).abs().max_element(),
-                            planned_center.map(|planned| (grid - planned).abs().max_element()),
+                            current_center.map(|current| (grid - current).abs().max_element()),
                         )
                     })
                     .collect()
@@ -5287,7 +5302,7 @@ fn validate_streaming_lifecycle(
             orphaned_roots,
             missing_roots,
             out_of_range_roots,
-            out_of_range_vs_planned,
+            out_of_range_vs_camera,
             planned_center = ?planned_center,
             current_center = ?current_center,
             plan_check_offset = ?plan_check_offset,
@@ -6947,7 +6962,7 @@ mod tests {
         );
         let metrics = streaming_metrics(&app);
         assert_eq!(metrics.out_of_range_cell_roots, 0);
-        assert_eq!(metrics.out_of_range_vs_planned_roots, 0);
+        assert_eq!(metrics.out_of_range_vs_camera_roots, 0);
         assert_eq!(metrics.max_plan_check_center_offset, 0);
         assert_eq!(metrics.streaming_invariant_failures, 0);
         assert_eq!(metrics.invariant_checks_without_plan, 0);
@@ -6966,15 +6981,21 @@ mod tests {
         app.update();
 
         let metrics = streaming_metrics(&app);
-        assert_eq!(metrics.out_of_range_cell_roots, 5);
-        assert_eq!(metrics.out_of_range_vs_planned_roots, 0);
+        assert_eq!(
+            metrics.out_of_range_cell_roots, 0,
+            "the planner had not seen the crossing, so it could not have retired the column yet"
+        );
+        assert_eq!(
+            metrics.out_of_range_vs_camera_roots, 5,
+            "the camera moved a cell past the plan, so it sees a column the plan kept"
+        );
         assert_eq!(metrics.max_plan_check_center_offset, 1);
-        assert_eq!(metrics.streaming_invariant_failures, 5);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
 
         app.update();
         let settled = streaming_metrics(&app);
-        assert_eq!(settled.out_of_range_cell_roots, 5);
-        assert_eq!(settled.out_of_range_vs_planned_roots, 0);
+        assert_eq!(settled.out_of_range_cell_roots, 0);
+        assert_eq!(settled.out_of_range_vs_camera_roots, 5);
     }
 
     #[test]
@@ -6990,7 +7011,7 @@ mod tests {
 
         let metrics = streaming_metrics(&app);
         assert_eq!(metrics.out_of_range_cell_roots, 1);
-        assert_eq!(metrics.out_of_range_vs_planned_roots, 1);
+        assert_eq!(metrics.out_of_range_vs_camera_roots, 1);
         assert_eq!(metrics.max_plan_check_center_offset, 0);
         assert_eq!(metrics.streaming_invariant_failures, 1);
     }
