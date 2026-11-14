@@ -67,7 +67,13 @@ struct InitialWorldCameraPose {
     resolution: bevy::window::WindowResolution,
 }
 
-fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorldCameraPose>> {
+fn prepare_start_camera(
+    config: &mut EngineConfig,
+    preferences: Option<&mut (
+        crate::settings::RenderingSettings,
+        crate::settings::SettingsFile,
+    )>,
+) -> Result<Option<InitialWorldCameraPose>> {
     let Some(path) = &config.start_shot else {
         return Ok(None);
     };
@@ -100,6 +106,13 @@ fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorld
     if let Some(worldspace) = worldspace {
         config.worldspace_id = worldspace;
     }
+    if let Some((settings, settings_file)) = preferences {
+        settings_file.apply_start_shot(
+            settings,
+            crate::shots::vertical_fov_degrees(file.shots[0].hfov, file.aspect()),
+            (file.width, file.height),
+        );
+    }
     Ok(Some(InitialWorldCameraPose {
         shot: file.shots[0].clone(),
         aspect: file.aspect(),
@@ -124,7 +137,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         "visual profile active; changing it requires a restart"
     );
     config.image_space_selection()?;
-    let start_camera = prepare_start_camera(&mut config)?;
+    let start_camera = prepare_start_camera(&mut config, preferences.as_mut())?;
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
     let route = prepare_route(&mut config)?;
@@ -3175,7 +3188,7 @@ mod tests {
             let original_worldspace = config.worldspace_id;
             let original_grid = config.start_grid;
 
-            let Err(error) = prepare_start_camera(&mut config) else {
+            let Err(error) = prepare_start_camera(&mut config, None) else {
                 panic!("{mode} must be rejected before loading the camera pose");
             };
 
@@ -3198,7 +3211,7 @@ mod tests {
             ..default()
         };
 
-        assert!(prepare_start_camera(&mut config).unwrap().is_none());
+        assert!(prepare_start_camera(&mut config, None).unwrap().is_none());
         assert_eq!(
             config.route.as_deref(),
             Some(std::path::Path::new("route.json"))
@@ -4422,7 +4435,7 @@ mod tests {
             start_shot: Some(file),
             ..default()
         };
-        let pose = prepare_start_camera(&mut config).unwrap().unwrap();
+        let pose = prepare_start_camera(&mut config, None).unwrap().unwrap();
         assert_eq!(config.start_grid, (5, -11));
         assert_eq!(config.worldspace_id, 60);
         assert!(config.interactive_world_physics());
@@ -4451,6 +4464,164 @@ mod tests {
             crate::shots::vertical_fov_degrees(80.0, 1920.0 / 1080.0).to_radians()
         );
         assert!(app.world().get_resource::<ShotsRun>().is_none());
+    }
+
+    fn interactive_framing_app(settings_path: &Path, shot_path: Option<PathBuf>) -> App {
+        let args = shot_path.map_or_else(Vec::new, |path| {
+            vec!["--start-shot".to_owned(), path.to_str().unwrap().to_owned()]
+        });
+        let crate::config::ConfigAction::Run(config) = EngineConfig::from_args(args).unwrap()
+        else {
+            panic!("expected an interactive run")
+        };
+        let mut config = *config;
+        let mut preferences =
+            crate::settings::prepare_settings_at(&mut config, Some(settings_path.to_owned()));
+        let pose = prepare_start_camera(&mut config, Some(&mut preferences)).unwrap();
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(preferences.0)
+            .insert_resource(preferences.1)
+            .add_systems(Startup, setup_world)
+            .add_systems(Update, crate::settings::apply_render_settings);
+        let window = Window {
+            resolution: pose
+                .as_ref()
+                .map_or_else(|| (1600, 900).into(), |pose| pose.resolution.clone()),
+            ..default()
+        };
+        app.world_mut().spawn((window, bevy::window::PrimaryWindow));
+        if let Some(pose) = pose {
+            app.insert_resource(pose);
+        }
+        app
+    }
+
+    fn assert_interactive_framing(app: &mut App, fov: f32, size: (u32, u32)) {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Projection, With<StreamingCamera>>();
+        let Projection::Perspective(projection) = query.single(app.world()).unwrap() else {
+            panic!("perspective camera")
+        };
+        assert!((projection.fov - fov.to_radians()).abs() < 1e-6);
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
+        let window = query.single(app.world()).unwrap();
+        assert_eq!((window.physical_width(), window.physical_height()), size);
+        assert_eq!(window.mode, bevy::window::WindowMode::Windowed);
+    }
+
+    fn reset_interactive_settings(app: &mut App) {
+        app.world_mut()
+            .resource_scope(|world, mut file: Mut<crate::settings::SettingsFile>| {
+                file.restore_defaults(
+                    &mut world.resource_mut::<crate::settings::RenderingSettings>(),
+                );
+            });
+        app.update();
+    }
+
+    #[test]
+    fn start_shot_framing_survives_settings_updates_without_saving_launch_values() {
+        use crate::settings::{RenderingSettings, SettingsFile, WINDOW_SIZES};
+        let directory = tempfile::tempdir().unwrap();
+        let shot_path = directory.path().join("pose.json");
+        std::fs::write(&shot_path, r#"{"width":1379,"height":911,"shots":[{"name":"custom","position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":18}]}"#).unwrap();
+        let settings_path = directory.path().join("settings.json");
+        // Include a preset equal to the reset default: reset must still clear custom dimensions.
+        for window_size in [1, 3] {
+            let saved = RenderingSettings {
+                fov_degrees: 99.0,
+                window_size,
+                window_mode: 1,
+                ..default()
+            };
+            let bytes = serde_json::to_vec(&saved).unwrap();
+            std::fs::write(&settings_path, &bytes).unwrap();
+            let mut app = interactive_framing_app(&settings_path, Some(shot_path.clone()));
+            let fov = crate::shots::vertical_fov_degrees(18.0, 1379.0 / 911.0);
+            app.update();
+            assert_interactive_framing(&mut app, fov, (1379, 911));
+            app.world_mut().resource_mut::<RenderingSettings>().hud = false;
+            app.update();
+            app.update();
+            assert_interactive_framing(&mut app, fov, (1379, 911));
+            assert_eq!(std::fs::read(&settings_path).unwrap(), bytes);
+            let active = app.world().resource::<RenderingSettings>().clone();
+            app.world_mut().resource_mut::<SettingsFile>().save(&active);
+            let persisted: RenderingSettings =
+                serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+            assert_eq!(persisted.fov_degrees, saved.fov_degrees);
+            assert_eq!(persisted.window_size, saved.window_size);
+            assert_eq!(persisted.window_mode, saved.window_mode);
+            assert_eq!(persisted.window_size_override, None);
+            assert!(!persisted.hud);
+            persisted.validate().unwrap();
+            reset_interactive_settings(&mut app);
+            let defaults = RenderingSettings::default();
+            assert_interactive_framing(
+                &mut app,
+                defaults.fov_degrees,
+                WINDOW_SIZES[defaults.window_size],
+            );
+        }
+    }
+
+    #[test]
+    fn start_shot_window_and_fov_controls_remain_editable() {
+        use crate::settings::{RenderingSettings, WINDOW_SIZES};
+        let directory = tempfile::tempdir().unwrap();
+        let shot_path = directory.path().join("pose.json");
+        std::fs::write(&shot_path, r#"{"width":1333,"height":777,"shots":[{"name":"custom","position":[0,0,140],"yaw":0,"pitch":0,"hfov":80}]}"#).unwrap();
+        let mut app =
+            interactive_framing_app(&directory.path().join("missing.json"), Some(shot_path));
+        app.update();
+        {
+            let mut settings = app.world_mut().resource_mut::<RenderingSettings>();
+            settings.window_size = 2;
+            settings.fov_degrees = 75.0;
+        }
+        app.update();
+        assert_interactive_framing(&mut app, 75.0, WINDOW_SIZES[2]);
+        app.world_mut().resource_mut::<RenderingSettings>().hud = false;
+        app.update();
+        assert_interactive_framing(&mut app, 75.0, WINDOW_SIZES[2]);
+    }
+
+    #[test]
+    fn ordinary_launch_and_reset_apply_preference_framing() {
+        use crate::settings::{RenderingSettings, WINDOW_SIZES};
+        let directory = tempfile::tempdir().unwrap();
+        for saved in [
+            None,
+            Some(RenderingSettings {
+                fov_degrees: 90.0,
+                window_size: 3,
+                ..default()
+            }),
+        ] {
+            let settings_path = directory.path().join("settings.json");
+            if let Some(settings) = &saved {
+                std::fs::write(&settings_path, serde_json::to_vec(settings).unwrap()).unwrap();
+            }
+            let expected = saved.unwrap_or_default();
+            let mut app = interactive_framing_app(&settings_path, None);
+            app.update();
+            assert_interactive_framing(
+                &mut app,
+                expected.fov_degrees,
+                WINDOW_SIZES[expected.window_size],
+            );
+            reset_interactive_settings(&mut app);
+            let defaults = RenderingSettings::default();
+            assert_interactive_framing(
+                &mut app,
+                defaults.fov_degrees,
+                WINDOW_SIZES[defaults.window_size],
+            );
+        }
     }
 
     #[test]
