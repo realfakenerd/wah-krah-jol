@@ -54,6 +54,56 @@ impl Default for GamePathConfig {
 }
 
 impl GamePathConfig {
+    /// Selects a parent for new conversions, while still accepting an existing package directly.
+    /// Keep the resolved package in the existing field so restored settings and explicit callers
+    /// retain their exact output path; no separate persistence or migration is needed.
+    pub fn choose_data_folder(&mut self, folder: &Path) -> Result<(), String> {
+        let folder = std::path::absolute(folder)
+            .map_err(|error| format!("Cannot locate {}: {error}", folder.display()))?;
+        let output = if folder.join(MANIFEST_FILE).is_file()
+            || converter::find_resumable_staging(&folder).is_some()
+        {
+            folder
+        } else {
+            folder.join("assets")
+        };
+        output_is_safe_target(&output)?;
+        self.converted_assets_path = output;
+        Ok(())
+    }
+
+    /// The parent containing the package and its sibling conversion workspaces.
+    pub fn data_folder_label(&self) -> String {
+        if self.converted_assets_path.as_os_str().is_empty() {
+            return "not chosen - drop a parent folder here".into();
+        }
+        self.converted_assets_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .display()
+            .to_string()
+    }
+
+    /// Actual package/cache paths and the converter's sibling staging-name pattern.
+    pub fn locations_label(&self) -> String {
+        let output = &self.converted_assets_path;
+        if output.as_os_str().is_empty() {
+            return "Package, staging and ingestion cache: choose a Mudcrab data folder first."
+                .into();
+        }
+        let mut staging_name = output.file_name().unwrap_or_default().to_os_string();
+        staging_name.push(".staging-*");
+        let staging = output.with_file_name(staging_name);
+        let cache = converter::PipelineConfig::new("", output).ingestion_cache_dir();
+        format!(
+            "Package: {}\nStaging (kept for Resume): {}\nIngestion cache: {}",
+            self.output_label(),
+            staging.display(),
+            cache.display()
+        )
+    }
+
     /// The folders a run would use, or `None` when the Data folder is missing or does not hold a
     /// `Skyrim.esm` (which is what makes it a Skyrim `Data` folder) or the output is empty.
     pub fn pair(&self) -> Option<(PathBuf, PathBuf)> {
@@ -903,6 +953,52 @@ pub(crate) mod tests {
         assert!(paths.output_label().contains("not chosen"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn location_labels_follow_parent_selection_and_explicit_package_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = GamePathConfig::default();
+        paths.choose_data_folder(root.path()).unwrap();
+        let output = root.path().join("assets");
+        assert_eq!(paths.converted_assets_path, output);
+        assert_eq!(paths.data_folder_label(), root.path().display().to_string());
+        assert_eq!(
+            paths.locations_label(),
+            format!(
+                "Package: {}\nStaging (kept for Resume): {}\nIngestion cache: {}",
+                output.display(),
+                root.path().join("assets.staging-*").display(),
+                root.path().join("assets.assets-cache").display()
+            )
+        );
+        // An explicit output (including a restored choice) is already a package, not a parent.
+        paths.converted_assets_path = root.path().join("Skyrim.Converted");
+        assert!(
+            paths
+                .locations_label()
+                .contains("Skyrim.Converted.staging-*")
+        );
+        assert!(
+            paths
+                .locations_label()
+                .contains("Skyrim.Converted.assets-cache")
+        );
+        assert!(!paths.locations_label().contains("Skyrim.Converted/assets"));
+        paths.converted_assets_path = PathBuf::from("modern_assets");
+        assert_eq!(paths.data_folder_label(), ".");
+        assert!(
+            paths
+                .locations_label()
+                .starts_with("Package: modern_assets\n")
+        );
+        paths.converted_assets_path.clear();
+        assert!(
+            paths
+                .locations_label()
+                .contains("choose a Mudcrab data folder first")
+        );
+        assert!(paths.data_folder_label().contains("not chosen"));
     }
 
     /// Publishing deletes what the Output folder held, so only a missing folder, an empty one or an

@@ -87,7 +87,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Mudcrab Launcher & Mod Manager".into(),
-                resolution: WindowResolution::new(900, 600),
+                resolution: WindowResolution::new(900, 680),
                 resizable: false,
                 ..default()
             }),

@@ -136,7 +136,7 @@ When conversion finishes (or on subsequent launches):
 
 ## 3. Conversion screen
 
-What `crates/launcher` builds today. The launcher is one window (900x600, not resizable): the
+What `crates/launcher` builds today. The launcher is one window (900x680, not resizable): the
 header, the conversion panel, the mod manager's drop zone (a stub that only logs what is dropped),
 and the Play row. `cargo run -p launcher` starts it.
 
@@ -157,7 +157,7 @@ complete conversion does not imply LOD coverage for every worldspace.
 | | |
 | :--- | :--- |
 | **Skyrim Data** | Where the game's assets are. Filled at start-up by game detection, or set by dropping a folder. A folder with a `Skyrim.esm` in it, case-insensitively, is a `Data` folder; dropping an installation root uses its `Data` subfolder. **Detect** looks again. |
-| **Output** | Where the converted tree is written, and what the engine is started on. Defaults to `modern_assets`, which is what the engine's `--assets` expects. Drop another folder to change it: an empty one or an earlier conversion (see "The Output folder is replaced"). The default may not exist yet; the first conversion creates it. |
+| **Mudcrab data** | Drop a parent folder to use `<chosen>/assets` as the package. Package, staging and ingestion-cache paths appear below the row. Dropping an existing package with `conversion-manifest.json` or resumable staging beside it uses that package directly. The existing `modern_assets` default and explicit package paths stay unchanged. |
 | **Bar** | Whole-run completion, from the same `converter::ProgressEstimate` the command line's status line prints, so it never moves backwards even when a stage finishes short of its total. |
 | **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. Terrain LOD shows processed/total worldspaces, including skipped worlds, without asset-rate estimates. |
 | **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. Terrain LOD shows elapsed time only; its timing is not calibrated. |
@@ -167,6 +167,19 @@ complete conversion does not imply LOD coverage for every worldspace.
 
 Clicking a disabled button does nothing: the missing `Skyrim.esm` or the empty output is reported in
 the notice pane instead.
+
+For a newly selected parent, all conversion work stays under that folder:
+
+```text
+<chosen>/assets                 package used by Play and Check
+<chosen>/assets.staging-*       unfinished conversion, kept for Resume
+<chosen>/assets.assets-cache    reusable ingestion cache
+```
+
+The parent may contain other files; only its package child must pass the converter's output
+safety check. Selection creates nothing. Publication still swaps sibling directories on the same
+filesystem, preserving the previous package until its replacement is ready. Resume discovery
+still searches beside the exact package path. Staging never moves inside the package.
 
 ### What the buttons do
 
@@ -255,8 +268,9 @@ converter's schema. It does not look at every artifact; Check and Full check do.
 ### Dropping things onto the launcher
 
 - A **folder** goes to the conversion panel: a Skyrim `Data` folder or installation root fills the
-  Data row, any other folder the Output row, if it is safe to convert into (new, empty, or an
-  earlier conversion; see "The Output folder is replaced"). A folder that is not keeps the Output
+  Data row. Any other folder selects a Mudcrab data parent, except an existing package with a
+  manifest or resumable staging beside it, which keeps its exact output path. The resulting package must be safe to convert into
+  (new, empty, or an earlier conversion; see "The Output folder is replaced"). An unsafe package keeps the Output
   row as it was, and the pane says why. Folders are taken only while the path rows are on (see
   the table): not while a conversion or a check runs, and not while a staging folder is waiting.
 - A **file** with a mod's extension (`.zip`, `.7z`, `.esp`, `.esm`, `.esl`) goes to the mod
