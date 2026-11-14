@@ -996,7 +996,10 @@ CREATE TABLE IF NOT EXISTS waters (
     fresnel REAL,                       -- DNAM+24: Fresnel Amount (Schlick F0)
     reflectivity REAL,                  -- DNAM+20: Reflectivity Amount
     flow_normal_path TEXT,              -- NAM5, canonicalised (SSE flowmap waters only)
-    data BLOB NOT NULL                  -- Serialized subrecords payload
+    data BLOB NOT NULL,                 -- Serialized subrecords payload
+    fog_near REAL,                      -- DNAM+32: above-water fog near distance (world units)
+    fog_far REAL,                       -- DNAM+36: above-water fog far distance (world units)
+    fog_amount REAL                     -- DNAM+132: above-water fog amount (curve exponent; 0 keeps clear)
 );
 ```
 
@@ -1004,10 +1007,19 @@ CREATE TABLE IF NOT EXISTS waters (
 `skyrim_world.db` built before they existed has a `waters` table without them, and
 `AssetCatalog::water_colors` (`crates/engine/src/world/database.rs`) returns `None` for every
 water against such a database rather than failing to open it. The engine falls back to Skyrim's
-DefaultWater values (`render::DEFAULT_WATER_FRESNEL` / `render::DEFAULT_WATER_REFLECTIVITY`, and
-`streaming.rs`'s deep-colour constant) until a reconversion populates them. Adding them did **not**
-bump `shared::WORLD_DATABASE_SCHEMA_VERSION`: nothing that already reads `waters` depends on their
-presence, and the fallback exists specifically so a reconversion is not required.
+DefaultWater values (`render::DEFAULT_WATER_FRESNEL`, `DEFAULT_WATER_REFLECTIVITY`,
+`DEFAULT_WATER_DEEP_COLOR`, `DEFAULT_WATER_SHALLOW_COLOR` and `DEFAULT_WATER_OPACITY`) until a
+reconversion populates them. `opacity` is not one of those additions: it has been in the table
+since the table was first created, so `water_colors` reads it without a probe.
+
+`fog_near`/`fog_far`/`fog_amount` are additive and probed the same way: they are appended to the
+table and the converter writes NULL for any water whose `DNAM` does not carry a complete, finite
+fog triple. A database without them still yields the colours and factors above but no fog, and the
+engine falls back to Skyrim's DefaultWater fog per record (`WaterFog::default()` in
+`crates/engine/src/world/database.rs`) until a reconversion populates them. Adding
+any of these did **not** bump `shared::WORLD_DATABASE_SCHEMA_VERSION`: nothing that already reads
+`waters` depends on their presence, and the fallback exists specifically so a reconversion is not
+required.
 
 ---
 

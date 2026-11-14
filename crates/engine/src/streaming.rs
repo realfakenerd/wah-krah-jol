@@ -21,7 +21,9 @@ use crate::{
             MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
             WorldPosition, WorldTransform,
         },
-        database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
+        database::{
+            AssetCatalog, CellKey, CellPayload, DatabaseRequest, WaterColors, WorldDatabase,
+        },
         water::{FlatWater, FlatWaterBody},
     },
 };
@@ -1743,43 +1745,11 @@ fn spawn_cell(
                             })
                             .load(path.to_owned())
                     });
-                // Skyrim's DefaultWater deep colour after Update.esm, used when this water has no
-                // decoded colours yet (a database converted before the WATR colour export). Skyrim
-                // thins water to show the bed where it is shallow; without depth fog a 60% cover
-                // keeps river beds visible.
-                let base_color = water_colors.map_or(Color::srgba_u8(5, 14, 18, 153), |colors| {
-                    let [r, g, b] = colors.deep;
-                    Color::srgba_u8(r, g, b, 153)
-                });
-                let (fresnel, reflectivity) = water_colors.map_or(
-                    (
-                        crate::render::DEFAULT_WATER_FRESNEL,
-                        crate::render::DEFAULT_WATER_REFLECTIVITY,
-                    ),
-                    |colors| (colors.fresnel, colors.reflectivity),
-                );
-                let water_material = water_materials.add(WaterMaterial {
-                    base: StandardMaterial {
-                        base_color,
-                        metallic: 0.15,
-                        perceptual_roughness: 0.06,
-                        reflectance: 0.9,
-                        alpha_mode: AlphaMode::Blend,
-                        ..default()
-                    },
-                    extension: WaterExtension::with_reflection_and_factors(
-                        reflection.0.clone(),
-                        flow_normal.clone(),
-                        fresnel,
-                        reflectivity,
-                    )
-                    .with_reflection_color(
-                        water_colors
-                            .map_or(crate::render::DEFAULT_WATER_REFLECTION_COLOR, |colors| {
-                                colors.reflection
-                            }),
-                    ),
-                });
+                let water_material = water_materials.add(water_material(
+                    water_colors,
+                    reflection.0.clone(),
+                    flow_normal.clone(),
+                ));
                 let mut water = parent.spawn((
                     Name::new("Water"),
                     Mesh3d(water_mesh),
@@ -5315,6 +5285,60 @@ impl TerrainCoverage {
     }
 }
 
+/// The material for a cell's water from its catalog row: the record's colours, reflectivity factors,
+/// opacity and above-water fog, with Skyrim's DefaultWater for whatever the database does not carry.
+fn water_material(
+    colors: Option<WaterColors>,
+    reflection: Handle<Image>,
+    flow_normal: Option<Handle<Image>>,
+) -> WaterMaterial {
+    // Skyrim's DefaultWater deep colour after Update.esm, used when this water has no
+    // decoded colours yet (a database converted before the WATR colour export). The
+    // shader mixes the shallow colour in and writes the body alpha itself from the
+    // water's opacity and the depth behind it, so the material alpha stays opaque.
+    let [r, g, b] = colors.map_or(crate::render::DEFAULT_WATER_DEEP_COLOR, |colors| {
+        colors.deep
+    });
+    let base_color = Color::srgb_u8(r, g, b);
+    let (fresnel, reflectivity) = colors.map_or(
+        (
+            crate::render::DEFAULT_WATER_FRESNEL,
+            crate::render::DEFAULT_WATER_REFLECTIVITY,
+        ),
+        |colors| (colors.fresnel, colors.reflectivity),
+    );
+    WaterMaterial {
+        base: StandardMaterial {
+            base_color,
+            metallic: 0.15,
+            perceptual_roughness: 0.06,
+            reflectance: 0.9,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        },
+        extension: WaterExtension::with_reflection_and_factors(
+            reflection,
+            flow_normal,
+            fresnel,
+            reflectivity,
+        )
+        .with_reflection_color(
+            colors.map_or(crate::render::DEFAULT_WATER_REFLECTION_COLOR, |colors| {
+                colors.reflection
+            }),
+        )
+        .with_body(
+            colors.map_or(crate::render::DEFAULT_WATER_SHALLOW_COLOR, |colors| {
+                colors.shallow
+            }),
+            colors.map_or(crate::render::DEFAULT_WATER_OPACITY, |colors| {
+                colors.opacity
+            }),
+            colors.and_then(|colors| colors.fog).unwrap_or_default(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5369,6 +5393,50 @@ mod tests {
         assert_eq!(
             json["asset_failures"].as_array().unwrap().len(),
             MAX_ASSET_FAILURES
+        );
+    }
+
+    #[test]
+    fn a_waters_catalog_fog_reaches_its_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); \
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); \
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,opacity INTEGER,shallow_color INTEGER,deep_color INTEGER,reflection_color INTEGER,fresnel REAL,reflectivity REAL,flow_normal_path TEXT,fog_near REAL,fog_far REAL,fog_amount REAL); \
+                 INSERT INTO waters VALUES (1,40,1,2,3,0.1,0.8,NULL,0.0,10.0,0.0); \
+                 INSERT INTO waters VALUES (2,60,1,2,3,0.1,0.8,NULL,-290.0,720.0,0.7); \
+                 INSERT INTO waters VALUES (3,50,1,2,3,0.1,0.8,NULL,NULL,NULL,NULL);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        let body = |form_id| {
+            water_material(catalog.water_colors(form_id), Handle::default(), None)
+                .extension
+                .body()
+        };
+
+        // Clear water: fog amount 0 keeps the body clear whatever the depth.
+        assert_eq!(body(1), Vec4::new(0.4, 0.0, 10.0, 0.0));
+        // A far distance other than DefaultWater's 150.
+        assert_eq!(body(2), Vec4::new(0.6, -290.0, 720.0, 0.7));
+        // No decoded fog, and no row at all: DefaultWater's fog.
+        let fallback = crate::world::database::WaterFog::default();
+        assert_eq!(
+            body(3),
+            Vec4::new(0.5, fallback.near, fallback.far, fallback.amount)
+        );
+        assert_eq!(
+            body(99),
+            Vec4::new(
+                f32::from(crate::render::DEFAULT_WATER_OPACITY) / 100.0,
+                fallback.near,
+                fallback.far,
+                fallback.amount
+            )
         );
     }
 

@@ -100,3 +100,8 @@ visible in a campaign report instead of being read as a pass.
 `--headless` is ignored during a shots run, because the shots runner requires the render loop. `--shots`
 cannot be combined with a benchmark, `--acceptance-screenshot`, `--auto-fly-speed` or a fixture.
 `--run-label` names the run in the window title (`Mudcrab - shots: <label>`).
+
+`--water-time <seconds>` pins the water's wave phase at that time, so two captures of the same
+pose draw the same ripples and reflection distortion. Without it the waves follow the clock, so
+interactive runs and benchmarks are unchanged; the terrain/water fixture keeps its own fixed phase
+unless `--water-time` overrides it. A negative or non-finite value is refused.

@@ -268,7 +268,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
              shallow_color INTEGER, deep_color INTEGER, reflection_color INTEGER,
              fresnel REAL, reflectivity REAL,
-             flow_normal_path TEXT, data BLOB NOT NULL
+             flow_normal_path TEXT, data BLOB NOT NULL,
+             fog_near REAL, fog_far REAL, fog_amount REAL
          );
          CREATE TABLE IF NOT EXISTS texture_sets (
              id INTEGER PRIMARY KEY, editor_id TEXT, diffuse_path TEXT, normal_path TEXT,
@@ -331,6 +332,18 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     add_missing_columns(conn, "actor_models", ACTOR_SKIN_TONE_COLUMNS)?;
     add_missing_columns(conn, "actor_models", ACTOR_WEIGHT_COLUMNS)?;
     add_missing_columns(conn, "actor_model_parts", ACTOR_PART_SKIN_COLUMNS)?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a reused older `waters` table as it was; give it the
+    // above-water fog columns, so a complete export can still insert into it. Fog is additive and
+    // probed like the colour/factor columns: a database without it still yields colours, no fog.
+    add_missing_columns(
+        conn,
+        "waters",
+        &[
+            ("fog_near", "REAL"),
+            ("fog_far", "REAL"),
+            ("fog_amount", "REAL"),
+        ],
+    )?;
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
@@ -925,8 +938,9 @@ fn export_records(
             "WATR" => {
                 let view = SubrecordView::new(&record.subrecords);
                 let dnam = view.find(b"DNAM").and_then(parse_water_dnam);
+                let fog = dnam.as_ref().and_then(|dnam| dnam.fog.as_ref());
                 tx.prepare_cached(
-                    "INSERT OR REPLACE INTO waters(id,editor_id,opacity,flags,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?.execute(
+                    "INSERT OR REPLACE INTO waters(id,editor_id,opacity,flags,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,data,fog_near,fog_far,fog_amount) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")?.execute(
                     params![
                         form_id,
                         view.get_string(b"EDID"),
@@ -939,6 +953,9 @@ fn export_records(
                         dnam.as_ref().map(|dnam| dnam.reflectivity),
                         water_flow_normal_path(&view),
                         blob,
+                        fog.map(|fog| fog.near),
+                        fog.map(|fog| fog.far),
+                        fog.map(|fog| fog.amount),
                     ],
                 )?;
             }
@@ -1274,6 +1291,15 @@ struct WaterDnam {
     shallow_color: u32,
     deep_color: u32,
     reflection_color: u32,
+    fog: Option<WaterFog>,
+}
+
+/// The above-water fog a record applies to its own body. All three are floats in world units;
+/// `amount` is the curve exponent (0 keeps the body clear).
+struct WaterFog {
+    near: f32,
+    far: f32,
+    amount: f32,
 }
 
 /// Packs a WATR colour subrecord's leading RGB bytes (plus the trailing pad byte, ignored by
@@ -1299,6 +1325,18 @@ fn parse_water_dnam(dnam: &[u8]) -> Option<WaterDnam> {
         shallow_color: dnam_color(dnam, 40)?,
         deep_color: dnam_color(dnam, 44)?,
         reflection_color: dnam_color(dnam, 48)?,
+        fog: parse_water_fog(dnam),
+    })
+}
+
+/// Decodes the above-water fog from a WATR `DNAM`. Fog is `None` when any of the three reads is
+/// out of range or non-finite, so a short or odd `DNAM` still exports its colours and factors
+/// but no fog; the engine then falls back to Skyrim's DefaultWater fog for that water.
+fn parse_water_fog(dnam: &[u8]) -> Option<WaterFog> {
+    Some(WaterFog {
+        near: dnam_f32(dnam, 32).filter(|value| value.is_finite())?,
+        far: dnam_f32(dnam, 36).filter(|value| value.is_finite())?,
+        amount: dnam_f32(dnam, 132).filter(|value| value.is_finite())?,
     })
 }
 
@@ -1790,14 +1828,20 @@ mod tests {
 
     /// A synthetic DNAM with DefaultWater's final (Update.esm-applied) values at the documented
     /// offsets (`docs/research/water.md` section 1.2/1.3): reflectivity 0.8, fresnel 0.10,
-    /// shallow (38,39,24), deep (5,14,18), reflection (119,140,157). Everything else is zeroed.
+    /// shallow (38,39,24), deep (5,14,18), reflection (119,140,157), above-water fog near -10.0,
+    /// far 150.0, amount 0.7. Everything else is zeroed.
     fn default_water_dnam(len: usize) -> Vec<u8> {
         let mut dnam = vec![0u8; len];
         dnam[20..24].copy_from_slice(&0.8f32.to_le_bytes());
         dnam[24..28].copy_from_slice(&0.10f32.to_le_bytes());
+        dnam[32..36].copy_from_slice(&(-10.0f32).to_le_bytes());
+        dnam[36..40].copy_from_slice(&150.0f32.to_le_bytes());
         dnam[40..44].copy_from_slice(&[38, 39, 24, 0]);
         dnam[44..48].copy_from_slice(&[5, 14, 18, 0]);
         dnam[48..52].copy_from_slice(&[119, 140, 157, 0]);
+        if len >= 136 {
+            dnam[132..136].copy_from_slice(&0.7f32.to_le_bytes());
+        }
         dnam
     }
 
@@ -1815,6 +1859,12 @@ mod tests {
             );
             assert!((parsed.fresnel - 0.10).abs() < 1.0e-6);
             assert!((parsed.reflectivity - 0.8).abs() < 1.0e-6);
+            let fog = parsed
+                .fog
+                .unwrap_or_else(|| panic!("{len}-byte DNAM must decode fog"));
+            assert!((fog.near - (-10.0)).abs() < 1.0e-6);
+            assert!((fog.far - 150.0).abs() < 1.0e-6);
+            assert!((fog.amount - 0.7).abs() < 1.0e-6);
         }
     }
 
@@ -1849,11 +1899,32 @@ mod tests {
         master.insert(record.form_id, record);
         export_to_db(&conn, &master).unwrap();
 
-        let (shallow, deep, reflection, fresnel, reflectivity): (u32, u32, u32, f32, f32) = conn
+        #[allow(clippy::type_complexity)]
+        let (shallow, deep, reflection, fresnel, reflectivity, fog_near, fog_far, fog_amount): (
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+        ) = conn
             .query_row(
-                "SELECT shallow_color, deep_color, reflection_color, fresnel, reflectivity FROM waters WHERE id=?1",
+                "SELECT shallow_color, deep_color, reflection_color, fresnel, reflectivity, fog_near, fog_far, fog_amount FROM waters WHERE id=?1",
                 [0x0000_0018u32],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(shallow, u32::from_le_bytes([38, 39, 24, 0]));
@@ -1861,6 +1932,108 @@ mod tests {
         assert_eq!(reflection, u32::from_le_bytes([119, 140, 157, 0]));
         assert!((fresnel - 0.10).abs() < 1.0e-6);
         assert!((reflectivity - 0.8).abs() < 1.0e-6);
+        assert!((fog_near.unwrap() - (-10.0)).abs() < 1.0e-6);
+        assert!((fog_far.unwrap() - 150.0).abs() < 1.0e-6);
+        assert!((fog_amount.unwrap() - 0.7).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn water_export_round_trips_puddle_fog_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // A puddle: near 0.0, far 10.0, amount 0.0 (the exponent that keeps the body clear).
+        // These round-trip through export byte-for-byte, so the engine can use them instead of
+        // DefaultWater's fog.
+        let mut dnam = default_water_dnam(228);
+        dnam[32..36].copy_from_slice(&0.0f32.to_le_bytes());
+        dnam[36..40].copy_from_slice(&10.0f32.to_le_bytes());
+        dnam[132..136].copy_from_slice(&0.0f32.to_le_bytes());
+        let record = RawRecord {
+            form_id: 0x0000_0019,
+            record_type: *b"WATR",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"PuddleWater\0".to_vec()),
+                (b"DNAM".to_vec(), dnam),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let mut master = HashMap::new();
+        master.insert(record.form_id, record);
+        export_to_db(&conn, &master).unwrap();
+
+        let (near, far, amount): (f32, f32, f32) = conn
+            .query_row(
+                "SELECT fog_near, fog_far, fog_amount FROM waters WHERE id=?1",
+                [0x0000_0019u32],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(near, 0.0);
+        assert_eq!(far, 10.0);
+        assert_eq!(amount, 0.0);
+    }
+
+    #[test]
+    fn short_dnam_still_exports_colors_but_no_fog() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // A DNAM too short to reach +132 (the fog amount) still carries the leading colours and
+        // factors; fog is all-or-nothing, so the three fog columns must come out NULL.
+        let record = RawRecord {
+            form_id: 0x0000_001A,
+            record_type: *b"WATR",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"ShortDnam\0".to_vec()),
+                (b"DNAM".to_vec(), default_water_dnam(100)),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let mut master = HashMap::new();
+        master.insert(record.form_id, record);
+        export_to_db(&conn, &master).unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let (shallow, deep, reflection, fresnel, reflectivity, fog_near, fog_far, fog_amount): (
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+        ) = conn
+            .query_row(
+                "SELECT shallow_color, deep_color, reflection_color, fresnel, reflectivity, fog_near, fog_far, fog_amount FROM waters WHERE id=?1",
+                [0x0000_001Au32],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(shallow, u32::from_le_bytes([38, 39, 24, 0]));
+        assert_eq!(deep, u32::from_le_bytes([5, 14, 18, 0]));
+        assert_eq!(reflection, u32::from_le_bytes([119, 140, 157, 0]));
+        assert!((fresnel - 0.10).abs() < 1.0e-6);
+        assert!((reflectivity - 0.8).abs() < 1.0e-6);
+        assert_eq!(fog_near, None);
+        assert_eq!(fog_far, None);
+        assert_eq!(fog_amount, None);
     }
 
     #[test]

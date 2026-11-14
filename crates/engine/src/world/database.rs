@@ -210,12 +210,41 @@ pub struct WorldDatabase {
     worker_stopped: Arc<AtomicBool>,
 }
 
-/// A water's Skyrim colours and reflectivity factors, decoded by the converter from its WATR
-/// record's `DNAM` (`crates/converter/src/esm/exporter.rs`). `fresnel`/`reflectivity` are
-/// additive `waters` columns: a database converted before they existed lacks them, so
-/// [`AssetCatalog::water_colors`] returns `None` for every water rather than erroring, and
-/// callers fall back to Skyrim's DefaultWater values (see `render::DEFAULT_WATER_FRESNEL` /
-/// `render::DEFAULT_WATER_REFLECTIVITY`).
+/// A water's above-water fog, decoded from its WATR `DNAM`: the view into the water starts to cloud
+/// `near` world units behind the surface, is fully opaque at `far`, and `amount` is the exponent of
+/// the curve between them (0 leaves the body clear).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaterFog {
+    pub near: f32,
+    pub far: f32,
+    pub amount: f32,
+}
+
+impl Default for WaterFog {
+    /// Skyrim's DefaultWater after Update.esm: fog near -10, far 150, amount 0.7.
+    fn default() -> Self {
+        Self {
+            near: -10.0,
+            far: 150.0,
+            amount: 0.7,
+        }
+    }
+}
+
+impl WaterFog {
+    fn is_usable(self) -> bool {
+        self.near.is_finite() && self.far.is_finite() && self.amount.is_finite()
+    }
+}
+
+/// A water's Skyrim colours, reflectivity factors and fog, decoded by the converter from its WATR
+/// record's `DNAM` (`crates/converter/src/esm/exporter.rs`). The colour/factor columns and the fog
+/// columns are additive `waters` columns: a database converted before they existed lacks them, so
+/// [`AssetCatalog::water_colors`] returns `None` for every water rather than erroring, and callers
+/// fall back to Skyrim's DefaultWater values (see `render::DEFAULT_WATER_FRESNEL`,
+/// `render::DEFAULT_WATER_REFLECTIVITY` and [`WaterFog::default`]). `fog` is per record: a WATR
+/// whose `DNAM` is too short to hold it, or that the database predates, reads as `None` while its
+/// colours stay usable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaterColors {
     pub shallow: [u8; 3],
@@ -223,6 +252,10 @@ pub struct WaterColors {
     pub reflection: [u8; 3],
     pub fresnel: f32,
     pub reflectivity: f32,
+    /// The water's `ANAM` opacity, 0-100: how much of the surface covers the bed. A water row with
+    /// no opacity reads as Skyrim's DefaultWater 50.
+    pub opacity: u8,
+    pub fog: Option<WaterFog>,
 }
 
 fn unpack_color(value: u32) -> [u8; 3] {
@@ -283,17 +316,41 @@ impl AssetCatalog {
         drop(statement);
         // A database converted before `fresnel`/`reflectivity` existed has no such columns, and
         // `prepare` fails with a "no such column" error rather than an empty result. Treat that
-        // the same as no water colours at all instead of refusing to open the catalog.
+        // the same as no water colours at all instead of refusing to open the catalog. The fog
+        // columns arrived later still; probing them keeps colours usable against an older database
+        // instead of dropping every water.
+        let has_fog = connection
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('waters') WHERE name='fog_near'")
+            .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
+            .unwrap_or(0)
+            > 0;
+        let fog_columns = if has_fog {
+            "fog_near,fog_far,fog_amount"
+        } else {
+            "NULL,NULL,NULL"
+        };
+        let water_colors_query = format!(
+            "SELECT id,shallow_color,deep_color,reflection_color,fresnel,reflectivity,COALESCE(opacity,50),{fog_columns} FROM waters \
+             WHERE shallow_color IS NOT NULL AND deep_color IS NOT NULL \
+             AND reflection_color IS NOT NULL AND fresnel IS NOT NULL AND reflectivity IS NOT NULL"
+        );
         let water_colors = connection
-            .prepare(
-                "SELECT id,shallow_color,deep_color,reflection_color,fresnel,reflectivity FROM waters \
-                 WHERE shallow_color IS NOT NULL AND deep_color IS NOT NULL \
-                 AND reflection_color IS NOT NULL AND fresnel IS NOT NULL AND reflectivity IS NOT NULL",
-            )
+            .prepare(&water_colors_query)
             .ok()
             .and_then(|mut statement| {
                 statement
                     .query_map([], |row| {
+                        let fog = match (
+                            row.get::<_, Option<f32>>(7)?,
+                            row.get::<_, Option<f32>>(8)?,
+                            row.get::<_, Option<f32>>(9)?,
+                        ) {
+                            (Some(near), Some(far), Some(amount)) => {
+                                let fog = WaterFog { near, far, amount };
+                                fog.is_usable().then_some(fog)
+                            }
+                            _ => None,
+                        };
                         Ok((
                             row.get::<_, u32>(0)?,
                             WaterColors {
@@ -302,6 +359,8 @@ impl AssetCatalog {
                                 reflection: unpack_color(row.get::<_, u32>(3)?),
                                 fresnel: row.get::<_, f32>(4)?,
                                 reflectivity: row.get::<_, f32>(5)?,
+                                opacity: row.get::<_, i64>(6)?.clamp(0, 100) as u8,
+                                fog,
                             },
                         ))
                     })
@@ -2082,7 +2141,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); \
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); \
-                 CREATE TABLE waters(id INTEGER PRIMARY KEY,shallow_color INTEGER,deep_color INTEGER,reflection_color INTEGER,fresnel REAL,reflectivity REAL,flow_normal_path TEXT);",
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,opacity INTEGER,shallow_color INTEGER,deep_color INTEGER,reflection_color INTEGER,fresnel REAL,reflectivity REAL,flow_normal_path TEXT);",
             )
             .unwrap();
         let shallow = u32::from_le_bytes([38, 39, 24, 0]);
@@ -2090,8 +2149,20 @@ mod tests {
         let reflection = u32::from_le_bytes([119, 140, 157, 0]);
         connection
             .execute(
-                "INSERT INTO waters(id,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (?1,?2,?3,?4,?5,?6,NULL)",
-                params![18u32, shallow, deep, reflection, 0.10f32, 0.8f32],
+                "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)",
+                params![18u32, 35u32, shallow, deep, reflection, 0.10f32, 0.8f32],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (?1,NULL,?2,?3,?4,?5,?6,NULL)",
+                params![19u32, shallow, deep, reflection, 0.10f32, 0.8f32],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path) VALUES (?1,140,?2,?3,?4,?5,?6,NULL)",
+                params![20u32, shallow, deep, reflection, 0.10f32, 0.8f32],
             )
             .unwrap();
         drop(connection);
@@ -2104,8 +2175,89 @@ mod tests {
                 reflection: [119, 140, 157],
                 fresnel: 0.10,
                 reflectivity: 0.8,
+                opacity: 35,
+                fog: None,
             })
         );
+        // A waters row with no ANAM reads as DefaultWater's 50, and an out-of-range one clamps
+        // rather than wrapping to a shifted alpha.
+        assert_eq!(
+            catalog.water_colors(19).map(|colors| colors.opacity),
+            Some(50)
+        );
+        assert_eq!(
+            catalog.water_colors(20).map(|colors| colors.opacity),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn catalog_returns_each_waters_fog() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); \
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); \
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,opacity INTEGER,shallow_color INTEGER,deep_color INTEGER,reflection_color INTEGER,fresnel REAL,reflectivity REAL,flow_normal_path TEXT,fog_near REAL,fog_far REAL,fog_amount REAL);",
+            )
+            .unwrap();
+        let shallow = u32::from_le_bytes([38, 39, 24, 0]);
+        let deep = u32::from_le_bytes([5, 14, 18, 0]);
+        let reflection = u32::from_le_bytes([119, 140, 157, 0]);
+        let insert = "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,fog_near,fog_far,fog_amount) VALUES (?1,50,?2,?3,?4,0.10,0.8,NULL,?5,?6,?7)";
+        connection
+            .execute(
+                insert,
+                params![24u32, shallow, deep, reflection, -10.0f32, 150.0f32, 0.7f32],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,fog_near,fog_far,fog_amount) VALUES (?1,0,?2,?3,?4,0.10,0.8,NULL,0.0,10.0,0.0)",
+                params![
+                    1013293u32,
+                    u32::from_le_bytes([0x26, 0x27, 0x18, 0]),
+                    u32::from_le_bytes([0x05, 0x0e, 0x12, 0]),
+                    u32::from_le_bytes([0x77, 0x8c, 0x9d, 0]),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO waters(id,opacity,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,fog_near,fog_far,fog_amount) VALUES (?1,50,?2,?3,?4,0.10,0.8,NULL,-10.0,150.0,NULL)",
+                params![
+                    7u32,
+                    shallow,
+                    deep,
+                    reflection,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        assert_eq!(
+            catalog.water_colors(24).map(|colors| colors.fog),
+            Some(Some(WaterFog {
+                near: -10.0,
+                far: 150.0,
+                amount: 0.7,
+            }))
+        );
+        // A puddle's fog amount is zero: the body stays clear while the colour mix still uses its
+        // ten-unit far distance.
+        assert_eq!(
+            catalog.water_colors(1013293).map(|colors| colors.fog),
+            Some(Some(WaterFog {
+                near: 0.0,
+                far: 10.0,
+                amount: 0.0,
+            }))
+        );
+        // A record the converter could not decode falls back to DefaultWater rather than losing
+        // its colours.
+        assert_eq!(catalog.water_colors(7).map(|colors| colors.fog), Some(None));
     }
 
     #[test]
