@@ -24,6 +24,8 @@ docs/specs/
 │   ├── launcher.md                    # Setup Wizard & GUI Launcher Specifications
 │   ├── mods-and-ui.md                 # Built-in Mod Manager & Flash-to-Bevy bsn! UI
 │   └── features.md                    # Unlocked Features (AI Dialogue, Co-op, Zero Loading)
+├── shared/                            # Shared Data Contracts
+│   └── form-key.md                    # Pack-scoped Identity Contract
 └── meta/                              # Domain & System Context
     ├── context.md                     # Domain Glossary & Canonical Definitions
     ├── platforms.md                   # Platform Compatibility Target Matrix
@@ -72,3 +74,7 @@ Project domain glossary and system benchmarks:
 - 📄 **[`context.md`](meta/context.md)** — Mudcrab canonical terms and domain glossary.
 - 📄 **[`platforms.md`](meta/platforms.md)** — Cross-platform target matrix (Windows, Linux, macOS, Android ARM64, WASM).
 - 📄 **[`requirements.md`](meta/requirements.md)** — Official Skyrim SE vs Mudcrab hardware system specs comparison.
+
+### 5. Shared contracts (`shared/`)
+
+- **[`form-key.md`](shared/form-key.md)** — Pack-scoped identities and the additive, output-preserving step 1 of #542.
