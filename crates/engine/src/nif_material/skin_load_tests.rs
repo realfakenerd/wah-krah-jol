@@ -35,7 +35,12 @@ impl GltfExtensionHandler for StockStandardHandler {
         context.add_labeled_asset(
             format!("{label}/std"),
             StandardMaterial {
+                base_color: loaded.base_color,
+                base_color_channel: loaded.base_color_channel.clone(),
                 base_color_texture: loaded.base_color_texture.clone(),
+                emissive: loaded.emissive,
+                emissive_channel: loaded.emissive_channel.clone(),
+                emissive_texture: loaded.emissive_texture.clone(),
                 normal_map_texture: loaded.normal_map_texture.clone(),
                 specular_tint_texture: loaded.specular_tint_texture.clone(),
                 alpha_mode: loaded.alpha_mode,
@@ -693,6 +698,49 @@ fn load_scene_world(app: &mut App) -> World {
         .world
 }
 
+#[test]
+fn own_emittance_scene_binds_the_diffuse_texture_and_preserves_stock_emission() {
+    let directory = tempfile::tempdir().unwrap();
+    write_model_space_gltf(directory.path(), (1 << 31) | (1 << 22));
+    let path = directory.path().join("body.gltf");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let material = &mut document["materials"][0];
+    material.as_object_mut().unwrap().remove("normalTexture");
+    material["extras"]["openSkyrim"] = serde_json::json!({
+        "shaderFamily":"lighting", "lightingShaderType":"default",
+        "shaderFlags1":(1u32 << 31) | (1 << 22), "shaderFlags2":1
+    });
+    material["pbrMetallicRoughness"] = serde_json::json!({"baseColorTexture":{"index":1}});
+    material["emissiveFactor"] = serde_json::json!([0.4980393, 0.4078432, 0.1725490]);
+    material["alphaMode"] = serde_json::json!("MASK");
+    material["alphaCutoff"] = serde_json::json!(0.4980392);
+    fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let mut app = loader_app(directory.path());
+    let mut world = load_scene_world(&mut app);
+    let mut query = world.query::<(&MeshMaterial3d<StandardMaterial>, &NifSourceMaterial)>();
+    let (native, stock) = query.single(&world).unwrap();
+    assert_ne!(native.0, stock.0, "the scene must draw the native material");
+    let materials = app.world().resource::<Assets<StandardMaterial>>();
+    let native = materials.get(&native.0).unwrap();
+    let stock = materials.get(&stock.0).unwrap();
+    assert_eq!(native.emissive, stock.emissive);
+    assert_eq!(native.emissive_texture, stock.base_color_texture);
+    assert_eq!(native.base_color_texture, stock.base_color_texture);
+    assert_eq!(native.alpha_mode, stock.alpha_mode);
+    assert!(stock.emissive_texture.is_none());
+    let image = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(native.emissive_texture.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        image.texture_descriptor.format,
+        TextureFormat::Rgba8UnormSrgb
+    );
+    assert_configured_sampler(image);
+}
+
 /// Alvor's hair tint as `00013475.nif` stores it: twice his `HCLF` colour.
 const ALVOR_HAIR: [f32; 3] = [0.439_215_7, 0.462_745_1, 0.345_098_05];
 
@@ -841,4 +889,76 @@ fn a_loaded_masked_hair_card_keeps_its_cutoff_and_specialises_as_hair() {
     // switches to coverage, which the hair key selects.
     assert_eq!(material.base.alpha_mode, AlphaMode::Mask(0.3));
     assert!(SkyrimSkinKey::from(&material.extension).hair);
+}
+
+#[test]
+fn palette_scenes_keep_labeled_image_dependencies_alive() {
+    for depth_wrapped in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        write_model_space_gltf(directory.path(), 0);
+        let path = directory.path().join("body.gltf");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["extensionsUsed"] = serde_json::json!(["OPEN_SKYRIM_material"]);
+        document["materials"][0] = serde_json::json!({
+            "extensions": {"OPEN_SKYRIM_material": {
+                "shaderFamily": "effect", "shaderFlags1": 16,
+                "textureSlots": [{"semantic": "greyscale", "texture": 1}]
+            }}
+        });
+        if depth_wrapped {
+            document["materials"][0]["extras"] = serde_json::json!({"openSkyrim": {
+                "shaderFlags1": 1u32 << 31, "shaderFlags2": 0
+            }});
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut app = loader_app(directory.path());
+        let scene: Handle<WorldAsset> = app
+            .world()
+            .resource::<AssetServer>()
+            .load(GltfAssetLabel::Scene(0).from_asset("body.gltf"));
+        wait_for_dependencies(&mut app, &scene);
+        let holder_id = app
+            .world()
+            .resource::<AssetServer>()
+            .get_path_id("body.gltf#Material0/nif_palette_image")
+            .expect("labeled palette holder remains registered")
+            .typed::<EffectPaletteImage>();
+        let mut scene_world = app
+            .world_mut()
+            .resource_mut::<Assets<WorldAsset>>()
+            .remove(&scene)
+            .unwrap()
+            .world;
+        let material = if depth_wrapped {
+            let mut query = scene_world.query::<&MeshMaterial3d<EffectPaletteDepthMaterial>>();
+            query.single(&scene_world).unwrap().0.clone().untyped()
+        } else {
+            let mut query = scene_world.query::<&MeshMaterial3d<EffectPaletteMaterial>>();
+            query.single(&scene_world).unwrap().0.clone().untyped()
+        };
+        drop(scene_world);
+        drop(scene);
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteImage>>()
+                .get(holder_id)
+                .is_some(),
+            "the material must keep its palette holder alive after the scene is dropped"
+        );
+        drop(material);
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteImage>>()
+                .get(holder_id)
+                .is_none(),
+            "the holder should be released after its material is dropped"
+        );
+    }
 }

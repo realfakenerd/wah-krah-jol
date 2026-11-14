@@ -949,14 +949,14 @@ fn export_records(
                     params![
                         form_id,
                         view.get_string(b"EDID"),
-                        view.get_string(b"TX00"),
-                        view.get_string(b"TX01"),
-                        view.get_string(b"TX03"),
-                        view.get_string(b"TX04"),
-                        view.get_string(b"TX05"),
-                        view.get_string(b"TX02"),
-                        view.get_string(b"TX07"),
-                        view.get_string(b"TX06"),
+                        texture_set_slot_path(&view, form_id, b"TX00"),
+                        texture_set_slot_path(&view, form_id, b"TX01"),
+                        texture_set_slot_path(&view, form_id, b"TX03"),
+                        texture_set_slot_path(&view, form_id, b"TX04"),
+                        texture_set_slot_path(&view, form_id, b"TX05"),
+                        texture_set_slot_path(&view, form_id, b"TX02"),
+                        texture_set_slot_path(&view, form_id, b"TX07"),
+                        texture_set_slot_path(&view, form_id, b"TX06"),
                     ],
                 )?;
             }
@@ -1234,6 +1234,26 @@ fn insert_grass(
         ],
     )?;
     Ok(())
+}
+
+/// One TXST slot's path as authored, or nothing when no asset lookup could accept it. The later
+/// texture passes treat a stored path they cannot canonicalize as fatal, so one bad slot would
+/// otherwise stop the whole conversion. The archived record keeps the original bytes.
+fn texture_set_slot_path(view: &SubrecordView<'_>, form_id: u32, slot: &[u8; 4]) -> Option<String> {
+    let path = view.get_string(slot)?;
+    if path.is_empty() {
+        return Some(path);
+    }
+    match canonical_asset_path(&path, AssetKind::Texture, "dds") {
+        Ok(_) => Some(path),
+        Err(error) => {
+            eprintln!(
+                "warning: TXST {form_id:08X} {}: dropped invalid texture path {path:?}: {error}",
+                String::from_utf8_lossy(slot)
+            );
+            None
+        }
+    }
 }
 
 fn water_flow_normal_path(view: &SubrecordView<'_>) -> Option<String> {

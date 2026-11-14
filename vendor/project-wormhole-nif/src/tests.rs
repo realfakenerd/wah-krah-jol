@@ -333,7 +333,17 @@ mod multi_bound {
     /// The same empty payload, declaring `num_triangles` triangles without
     /// storing geometry: a zero data size means there is nothing to read.
     fn shape_bytes(num_triangles: u16) -> Vec<u8> {
-        let mut bytes = av_object_bytes(u32::MAX);
+        shape_bytes_with_transform(num_triangles, [0.0; 3])
+    }
+
+    /// A `BSTriShape` whose own `NiAVObject` transform carries `translation`.
+    fn shape_bytes_with_transform(num_triangles: u16, translation: [f32; 3]) -> Vec<u8> {
+        let mut bytes = av_object_bytes_with_transform(
+            u32::MAX,
+            translation,
+            1.0,
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        );
         for value in [0.0f32, 0.0, 0.0, 0.0] {
             bytes.extend_from_slice(&value.to_le_bytes()); // bounding sphere
         }
@@ -572,20 +582,18 @@ mod multi_bound {
     fn shapes_under_ordered_billboard_and_value_nodes_keep_their_parents() {
         // root -> ordered -> billboard -> value -> shape, as in the forge's fire and glow.
         let quarter_turn = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let nif = nif_file(
             vec![
+                // Skyrim places a model by replacing the root block's transform, and the
+                // converter publishes the root without one. Keep it identity here so the
+                // expected placement below never encodes a transform the model drops.
                 parse_block(
-                    &node_bytes_with_transform(0, 1, [10.0, 20.0, 30.0], 2.0, quarter_turn),
+                    &node_bytes_with_transform(0, 1, [0.0; 3], 1.0, identity),
                     "NiNode",
                 ),
                 parse_block(
-                    &ordered_node_bytes_with_transform(
-                        1,
-                        2,
-                        [1.0, 0.0, 0.0],
-                        1.0,
-                        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                    ),
+                    &ordered_node_bytes_with_transform(1, 2, [10.0, 20.0, 30.0], 2.0, quarter_turn),
                     "BSOrderedNode",
                 ),
                 {
@@ -678,8 +686,81 @@ mod multi_bound {
             * local(billboard_index)
             * local(value_index)
             * local(shape_index);
+        // Shape at the origin through value (0, 0, 4) and billboard (0, 3, 0), then the ordered
+        // node's quarter turn, double scale and (10, 20, 30) placement: (4, 20, 38).
         let placement = inherited.transform_point3(glam::Vec3::ZERO);
-        assert!((placement - glam::Vec3::new(4.0, 22.0, 38.0)).length() < 1.0e-4);
+        assert!((placement - glam::Vec3::new(4.0, 20.0, 38.0)).length() < 1.0e-4);
+    }
+
+    /// The converter publishes an identity root, because a placed reference replaces the model
+    /// root's transform; that drop is `clear_root_transform` in `crates/converter/src/mesh.rs`,
+    /// not this crate. The model layer must keep the authored transform, so this test and the
+    /// converter's `the_root_nodes_own_transform_moves_neither_render_nodes_nor_collision` pin
+    /// the split: if either layer starts doing the other's job, one of them fails.
+    #[test]
+    fn the_model_layer_keeps_the_authored_root_transform() {
+        let quarter_turn = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let nif = nif_file(
+            vec![
+                parse_block(
+                    &node_bytes_with_transform(0, 1, [10.0, 20.0, 30.0], 2.0, quarter_turn),
+                    "NiNode",
+                ),
+                // An empty shape keeps its node without a mesh, so the placement below is the
+                // shape node's own transform composed under the root.
+                parse_block(
+                    &shape_bytes_with_transform(0, [1.0, 0.0, 0.0]),
+                    "BSTriShape",
+                ),
+            ],
+            &["root"],
+        );
+
+        let model = nif_to_static_model(&nif).unwrap();
+        let root = model
+            .static_nodes
+            .iter()
+            .find(|node| node.block_index == 0)
+            .unwrap();
+        assert_eq!(root.translation, Vec3::new(10.0, 20.0, 30.0));
+        assert_eq!(root.scale, 2.0);
+        assert_ne!(
+            root.rotation,
+            Mat3::IDENTITY,
+            "the authored root rotation is kept"
+        );
+
+        let (gltf, _) = model.to_gltf("root-kept".to_string()).unwrap();
+        let root_index = gltf
+            .nodes
+            .iter()
+            .position(|node| node.name.as_deref() == Some("root"))
+            .unwrap();
+        let root_node = &gltf.nodes[root_index];
+        assert_eq!(root_node.translation, Some([10.0, 20.0, 30.0]));
+        assert_eq!(root_node.scale, Some([2.0, 2.0, 2.0]));
+
+        let local = |index: usize| {
+            let node = &gltf.nodes[index];
+            glam::Mat4::from_scale_rotation_translation(
+                node.scale
+                    .as_ref()
+                    .map(|scale| glam::Vec3::from_array(*scale))
+                    .unwrap_or(glam::Vec3::ONE),
+                node.rotation
+                    .as_ref()
+                    .map(|rotation| glam::Quat::from_array(rotation.0))
+                    .unwrap_or(glam::Quat::IDENTITY),
+                node.translation
+                    .as_ref()
+                    .map(|translation| glam::Vec3::from_array(*translation))
+                    .unwrap_or(glam::Vec3::ZERO),
+            )
+        };
+        let shape_index = gltf.nodes[root_index].children.as_ref().unwrap()[0].value();
+        let placement = (local(root_index) * local(shape_index)).transform_point3(glam::Vec3::ZERO);
+        // (1, 0, 0) turns to (0, 1, 0), doubles to (0, 2, 0), then translates to (10, 22, 30).
+        assert!((placement - glam::Vec3::new(10.0, 22.0, 30.0)).length() < 1.0e-4);
     }
 }
 

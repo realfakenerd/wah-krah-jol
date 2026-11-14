@@ -17,7 +17,7 @@ from . import forwarding, host, lifecycle, memory, processes
 
 GIB = 1024 ** 3
 PROTECTED = re.compile(r'(engine(?:-[A-Za-z0-9]+)?|model[-_]inspector(?:-.*)?|human[-_]goat.*|actor_idle_probe|SkyrimSE(?:\.exe)?)', re.I)
-FAULT = re.compile(r'INSPECTOR_LOAD_FAILED|INSPECTOR_LOAD_TIMEOUT|panicked at|validation error|device.?lost|\bERROR\b', re.I)
+FAULT = re.compile(r'INSPECTOR_LOAD_FAILED|INSPECTOR_LOAD_TIMEOUT|(?i:panicked at|validation error|device.?lost)|\bERROR\b')
 
 
 def need(condition, message):

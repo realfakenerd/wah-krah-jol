@@ -16,6 +16,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use shared::collision::CollisionBody;
 use std::path::Path;
 
+#[cfg(test)]
+mod stair_tests;
+
 use crate::{
     console::{AppConsoleExt, ConsoleCommand, ConsoleState, console_closed},
     profiling::ProfilingState,
@@ -25,6 +28,7 @@ use crate::{
 
 /// Fixed physics step: 60 Hz Rapier simulation (V15, V18).
 pub const PHYSICS_TIMESTEP: f32 = 1.0 / 60.0;
+const PLAYER_CONTROLLER_OFFSET: f32 = 2.0;
 const NPC_DEFAULT_MOVT_FORM_ID: u32 = 0x0003_580D;
 /// Shared downward gravity in Creation units/s^2 for WALK and tankards (V11, V15).
 pub const GRAVITY_CREATION_UNITS: f32 = 900.0;
@@ -571,11 +575,11 @@ impl Plugin for PlayerControlsPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                // Both hold release and movement pause while the destination is unloaded or
-                // gameplay input belongs to the console/settings menu.
+                // Input stays paused throughout a crossing. Placement and gravity settle behind
+                // black once destination assets are ready, before the crossing may fade in.
                 (release_walk_spawn_hold, walk_movement_system)
                     .chain()
-                    .run_if(crate::door_crossing::no_door_crossing)
+                    .run_if(crate::door_crossing::walk_physics_allowed)
                     .run_if(console_closed)
                     .before(PhysicsSet::SyncBackend),
             );
@@ -1494,6 +1498,13 @@ pub struct WalkSpawnHold {
     destination: bool,
 }
 
+impl WalkSpawnHold {
+    /// Whether safe placement still owns the walking body.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 /// Validated local terrain height for the initial interactive player pose.
 #[derive(Debug, Default, Resource)]
 pub struct WalkSpawnGroundHeight(pub Option<f32>);
@@ -1514,6 +1525,7 @@ fn release_walk_spawn_hold(
     mut player: Query<(Entity, &mut Transform, &Collider), With<PlayerBody>>,
     mut reset: MotionReset,
     mut commands: Commands,
+    crossing: Option<Res<crate::door_crossing::DoorCrossing>>,
 ) {
     if !hold.active || *mode != MoveMode::Walk {
         return;
@@ -1564,9 +1576,19 @@ fn release_walk_spawn_hold(
     match result {
         Ok(position) => {
             body.translation = position;
+            // Support from before placement cannot prove the new capsule is grounded.
+            commands
+                .entity(entity)
+                .remove::<KinematicCharacterControllerOutput>();
             status.blocked_reason = None;
         }
         Err(reason) => {
+            // A door owns its bounded rollback/recovery. Do not turn a failed WALK landing
+            // into a successful NOCLIP arrival while the screen is still black.
+            if crossing.is_some_and(|crossing| crossing.is_active()) {
+                status.blocked_reason = Some(reason);
+                return;
+            }
             commands.entity(entity).insert(RigidBodyDisabled);
             *mode = MoveMode::Noclip;
             warn!("WALK collision fallback: {reason}");
@@ -1637,13 +1659,10 @@ pub fn player_controller_bundle(tuning: &MovementTuning) -> impl Bundle {
         player_collision_groups(),
         KinematicCharacterController {
             up: Vect::Y,
-            offset: CharacterLength::Absolute(2.0),
+            offset: CharacterLength::Absolute(PLAYER_CONTROLLER_OFFSET),
             slide: true,
-            autostep: Some(CharacterAutostep {
-                max_height: CharacterLength::Absolute(tuning.autostep_height),
-                min_width: CharacterLength::Absolute(tuning.capsule_radius),
-                include_dynamic_bodies: false,
-            }),
+            // WALK resolves steps with bounded capsule sweeps before SyncBackend.
+            autostep: None,
             max_slope_climb_angle: tuning.slope_climb_degrees.to_radians(),
             min_slope_slide_angle: tuning.slope_slide_degrees.to_radians(),
             // NOTE: upstream Rapier 0.35 manifold-transfer panic (see T4 gate
@@ -1699,36 +1718,197 @@ pub fn integrate_walk(
     }
 }
 
+type WalkBodyQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Transform,
+        &'static Collider,
+        &'static mut KinematicCharacterController,
+        &'static mut WalkState,
+        Option<&'static KinematicCharacterControllerOutput>,
+    ),
+>;
+
 /// Fixed-step walk integration + controller feed (V10, V11, V18).
 pub fn walk_movement_system(
     mode: Res<MoveMode>,
     hold: Option<Res<WalkSpawnHold>>,
     mut intent: ResMut<WalkIntent>,
     tuning: Res<MovementTuning>,
-    mut player: Query<(
-        &mut KinematicCharacterController,
-        &mut WalkState,
-        Option<&KinematicCharacterControllerOutput>,
-    )>,
+    context: ReadRapierContext,
+    mut player: WalkBodyQuery,
 ) {
     if *mode != MoveMode::Walk {
         return;
     }
-    let Ok((mut controller, mut state, output)) = player.single_mut() else {
+    let Ok((entity, mut body, capsule, mut controller, mut state, output)) = player.single_mut()
+    else {
         return;
     };
+    controller.custom_shape = None;
     if hold.as_ref().is_some_and(|hold| hold.active) {
         *state = WalkState::default();
         intent.jump_pressed = false;
-        controller.translation = Some(Vec3::ZERO);
+        // Even a zero move lets Rapier depenetrate an overlapping capsule. Only the bounded
+        // placement search may move a held body; do not run the controller until it succeeds.
+        controller.translation = None;
         return;
     }
     let grounded = output.map(|o| o.grounded).unwrap_or(false);
     integrate_walk(&mut state, &intent, &tuning, PHYSICS_TIMESTEP, grounded);
     intent.jump_pressed = false;
-    let displacement =
+    let mut displacement =
         (state.horizontal_velocity + Vec3::Y * state.vertical_velocity) * PHYSICS_TIMESTEP;
+    if state.grounded
+        && !state.jump_active
+        && let Ok(context) = context.single()
+        && let Some(rise) = walk_step_rise(
+            &context,
+            entity,
+            &body,
+            capsule,
+            &controller,
+            &tuning,
+            displacement.reject_from_normalized(Vec3::Y),
+        )
+    {
+        // The upward sweep validated this segment. Rapier runs the controller
+        // before syncing transforms, so override this tick's query pose too.
+        // Do not subtract the lift from the horizontal tick: built-in autostep
+        // does so, undoing the step at narrow treads and coplanar landing joins.
+        body.translation.y += rise;
+        controller.custom_shape = Some((
+            capsule.clone(),
+            body.rotation.inverse() * (Vec3::Y * rise),
+            Quat::IDENTITY,
+        ));
+        state.grounded = false;
+        state.vertical_velocity = 0.0;
+        displacement.y = 0.0;
+    }
     controller.translation = Some(displacement);
+}
+
+/// Find a supported step without changing the requested horizontal distance.
+/// All casts use the full capsule and exclude dynamic bodies only for stepping.
+#[allow(clippy::too_many_arguments)]
+fn walk_step_rise(
+    context: &RapierContext,
+    entity: Entity,
+    body: &Transform,
+    capsule: &Collider,
+    controller: &KinematicCharacterController,
+    tuning: &MovementTuning,
+    horizontal: Vec3,
+) -> Option<f32> {
+    let distance = horizontal.length();
+    if distance <= f32::EPSILON {
+        return None;
+    }
+    let direction = horizontal / distance;
+    let filter = QueryFilter {
+        flags: controller.filter_flags,
+        groups: controller.filter_groups,
+        ..QueryFilter::default().exclude_rigid_body(entity)
+    };
+    let static_filter = QueryFilter {
+        flags: filter.flags | QueryFilterFlags::EXCLUDE_DYNAMIC,
+        ..filter
+    };
+    let cast = |position, direction, distance, filter| {
+        context
+            .cast_shape(
+                position,
+                body.rotation,
+                direction,
+                &*capsule.raw,
+                ShapeCastOptions {
+                    target_distance: PLAYER_CONTROLLER_OFFSET,
+                    stop_at_penetration: false,
+                    max_time_of_impact: distance,
+                    compute_impact_geometry_on_penetration: true,
+                },
+                filter,
+            )
+            .map(|(_, hit)| hit)
+    };
+    let blocking_hit = cast(body.translation, direction, distance, static_filter)?;
+    let obstacle = blocking_hit.details?;
+    let walkable = controller.max_slope_climb_angle.cos();
+    if obstacle.normal1.y > walkable {
+        // A zero-distance floor hit can consume all 20 move-and-slide iterations
+        // while the default 1e-4 normal nudge cannot recover the lost skin gap.
+        // Repair only measured skin overlap, with an upward clearance sweep;
+        // ordinary slope contacts continue through Rapier without a step.
+        let capsule_point = body.translation + body.rotation * obstacle.witness2;
+        let gap = (capsule_point - obstacle.witness1).dot(obstacle.normal1);
+        if blocking_hit.time_of_impact > f32::EPSILON
+            || !(-PLAYER_CONTROLLER_OFFSET..PLAYER_CONTROLLER_OFFSET).contains(&gap)
+        {
+            // Recover at most one skin width of overlap. Deeper penetration
+            // needs placement recovery, not a full autostep-height relocation.
+            return None;
+        }
+        let lift = (PLAYER_CONTROLLER_OFFSET + 0.05 - gap) / obstacle.normal1.y;
+        return (lift > 0.0
+            && lift <= tuning.autostep_height
+            && cast(body.translation, Vec3::Y, lift, filter).is_none())
+        .then_some(lift);
+    }
+    if obstacle.normal1.y < 0.0 {
+        return None;
+    }
+    let approach = -direction.dot(obstacle.normal1.with_y(0.0).normalize_or_zero());
+    if approach <= f32::EPSILON {
+        return None;
+    }
+    // Advance far enough to probe a walkable capsule-edge contact, including an
+    // oblique approach. A radius-wide probe instead hits the next 24-unit riser.
+    let corner_advance = tuning.capsule_radius * (1.0 - controller.max_slope_climb_angle.sin());
+    let probe = (corner_advance / approach + PLAYER_CONTROLLER_OFFSET).max(distance);
+    if probe > tuning.capsule_radius + distance + PLAYER_CONTROLLER_OFFSET {
+        return None; // A glancing contact cannot borrow support beyond the capsule's reach.
+    }
+    let budget = tuning.autostep_height;
+    if cast(body.translation, Vec3::Y, budget, filter).is_some() {
+        return None;
+    }
+    let raised = body.translation + Vec3::Y * budget;
+    if cast(raised, direction, probe, filter).is_some() {
+        return None;
+    }
+    let landing = cast(
+        raised + direction * probe,
+        Vec3::NEG_Y,
+        budget,
+        static_filter,
+    )?
+    .details?;
+    if landing.normal1.y < walkable {
+        return None;
+    }
+    // Use the obstacle surface height, not the rounded capsule's hypothetical
+    // position at the lookahead point. Rapier 0.35 predicts ground at offset+0.05;
+    // that same slop keeps a new landing outside numerical skin penetration.
+    let rise = landing.witness1.y + tuning.capsule_standing_height * 0.5 + PLAYER_CONTROLLER_OFFSET
+        - body.translation.y;
+    if rise <= 0.05 || rise > budget {
+        return None;
+    }
+    let lift = (rise + 0.05).min(budget);
+    if cast(
+        body.translation + Vec3::Y * lift,
+        direction,
+        distance,
+        filter,
+    )
+    .is_some()
+    {
+        return None;
+    }
+    Some(lift)
 }
 
 /// Camera follows the capsule at eye height; yaw on body, pitch on view (V9).
@@ -1858,6 +2038,7 @@ type TeleportBodyQuery<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Transform,
         Option<&'static mut WalkState>,
         Option<&'static mut KinematicCharacterController>,
@@ -1879,6 +2060,7 @@ fn apply_teleport_player(
     mut intent: ResMut<WalkIntent>,
     mut body: TeleportBodyQuery,
     mut camera: Query<&mut Transform, (With<StreamingCamera>, Without<PlayerBody>)>,
+    mut commands: Commands,
 ) {
     let Some(teleport) = teleports.read().last().copied() else {
         return;
@@ -1896,10 +2078,13 @@ fn apply_teleport_player(
     let rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, 0.0, 0.0);
     let (body_position, camera_position) = body_and_camera_for_feet(&tuning, teleport.position);
     if *mode == MoveMode::Walk
-        && let Ok((mut transform, state, controller, velocity)) = body.single_mut()
+        && let Ok((entity, mut transform, state, controller, velocity)) = body.single_mut()
     {
         transform.translation = body_position;
         transform.rotation = rotation;
+        commands
+            .entity(entity)
+            .remove::<KinematicCharacterControllerOutput>();
         if let Some(mut state) = state {
             *state = WalkState::default();
         }
@@ -5009,6 +5194,13 @@ mod console_tests {
         // V and the closing backtick land in the same update.
         send_key(&mut app, KeyCode::KeyV);
         send_key(&mut app, KeyCode::Backquote);
+        // A selection click delivered with the closing key must not recapture the cursor.
+        app.world_mut()
+            .write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: bevy::input::ButtonState::Pressed,
+                window: Entity::PLACEHOLDER,
+            });
         app.update();
         assert!(!app.world().resource::<ConsoleState>().open);
         // The capture that movement and look read stays released for the closing frame, so they

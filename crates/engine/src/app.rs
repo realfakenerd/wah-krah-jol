@@ -368,6 +368,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             SkyPlugin,
             SkyrimCinematicPostPlugin,
             ConsolePlugin,
+            crate::console_selection::ConsoleSelectionPlugin,
             crate::bug_report::BugReportPlugin,
             crate::nif_material::EffectPaletteMaterialPlugin,
             crate::nif_material::NifMaterialPlugin,
@@ -389,6 +390,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_plugins(crate::terrain_merge::TerrainMergePlugin::new(
             terrain_merge.as_ref(),
         ));
+    #[cfg(feature = "collision-measure")]
+    if std::env::var_os("MUDCRAB_COLLISION_MEASURE").is_some() {
+        app.add_plugins(crate::collision_measure::MeasurePlugin);
+    }
     if interactive_world_physics {
         app.add_plugins(crate::settings_ui::SettingsPlugin);
     }
@@ -421,6 +426,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .insert_resource(crate::physics::WalkSpawnGroundHeight(spawn_ground_height))
             .add_plugins(StreamingPlugin);
+        #[cfg(feature = "collision-measure")]
+        if std::env::var_os("MUDCRAB_PLACEMENT_PROBE").is_some() {
+            app.add_plugins(crate::scene_placement_probe::ScenePlacementProbe);
+        }
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
                 route = %plan.source,

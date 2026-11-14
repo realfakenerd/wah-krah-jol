@@ -69,7 +69,7 @@ streams the converted world for you to walk through. Skyrim is not playable as a
   Build Tools on Windows, Xcode Command Line Tools on macOS, GCC or Clang on Linux.
 - **Linux only:** Bevy's [system libraries](https://github.com/bevyengine/bevy/blob/main/docs/linux_dependencies.md).
   With [devenv](https://devenv.sh), `devenv shell` provides them.
-- **A GPU** with Vulkan, DirectX 12 or Metal support.
+- **A GPU** with Vulkan, DirectX 12 or Metal support, including the BC formats used by converted textures.
 - **Disk space:** 20–30 GB for build output. See
   [build and conversion requirements](docs/specs/meta/requirements.md) for times and sizes.
 
@@ -170,8 +170,13 @@ understand directly. The workspace is split into these crates:
 
 Mudcrab is built in five phases. The full plans are in [`docs/roadmap/`](docs/roadmap/README.md).
 
-- [x] **[Phase 1: Asset modernization pipeline](docs/roadmap/01-asset-pipeline.md).** Transpile
-  legacy `.esm`, `.nif`, `.dds` and `.pex` into SQLite, glTF 2.0, KTX2 and Luau.
+- [ ] **[Phase 1: Asset modernization pipeline](docs/roadmap/01-asset-pipeline.md).** Pipeline
+  modules are integrated; acceptance remains tracked in [#162](https://github.com/Mudcrab-Team/mudcrab/issues/162).
+  Textures use native BC preservation, CPU BC7 encoding and UASTC fallback.
+  [ADR-0014](docs/adr/0014-phase1-desktop-texture-contract.md) defers the portable
+  (ASTC/ETC2) texture profile; it is tracked in
+  [#548](https://github.com/Mudcrab-Team/mudcrab/issues/548) under
+  [#274](https://github.com/Mudcrab-Team/mudcrab/issues/274).
 - [ ] **[Phase 2: Core engine runtime and Vercidium renderer](docs/roadmap/02-core-engine.md).**
   Runtime, integration, profiling and acceptance infrastructure are implemented; real-asset
   sign-off is pending.

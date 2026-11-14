@@ -11,6 +11,7 @@ pub mod cell_commands;
 pub mod color_pipeline;
 pub mod config;
 pub mod console;
+mod console_selection;
 pub mod door_crossing;
 pub mod doors;
 pub mod emittance;
@@ -57,3 +58,9 @@ pub mod world;
 pub use app::run;
 
 mod mesh_residency_audit;
+
+#[doc(hidden)]
+pub mod collision_measure;
+
+#[cfg(feature = "collision-measure")]
+mod scene_placement_probe;

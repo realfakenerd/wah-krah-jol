@@ -625,6 +625,11 @@ fn streaming_snapshot(metrics: &StreamingMetrics) -> Value {
                 .filter(|text| text.len() > MAX_FIELD_BYTES).count()})
         })
         .collect();
+    // The collector retains a bounded ring and counts every failure; the export shows the
+    // newest of the retained entries and the exact total, so a repeated failure is never
+    // silently dropped from the count.
+    let exported_asset_failures = failures.len();
+    let asset_failures_total = metrics.asset_failures.total();
     json!({
         "resident_cells": metrics.resident_cells, "loading_cells": metrics.loading_cells,
         "failed_cells_total": metrics.failed_cells, "retiring_cells": metrics.retiring_cells,
@@ -643,7 +648,9 @@ fn streaming_snapshot(metrics: &StreamingMetrics) -> Value {
         "commit_budget_violations": metrics.commit_budget_violations,
         "recent_asset_failures": failures,
         "failure_order": "newest first by insertion order; records have no timestamps",
-        "omitted_asset_failures": metrics.asset_failures.len().saturating_sub(MAX_FAILURES),
+        "asset_failures_total": asset_failures_total,
+        "omitted_asset_failures": asset_failures_total.saturating_sub(exported_asset_failures as u64),
+        "retained_asset_failures": metrics.asset_failures.len(),
         "failure_limit": MAX_FAILURES, "dependency_limit_per_failure": MAX_DEPENDENCIES,
     })
 }
@@ -1028,7 +1035,10 @@ mod tests {
     #[test]
     fn failure_export_takes_recent_bounded_entries_and_utf8_fields() {
         let mut metrics = StreamingMetrics::default();
-        for id in 0..100 {
+        // More failures than the collector retains: the export must show the newest retained
+        // entries and still count every recorded failure, including evicted ones.
+        let recorded = crate::streaming::MAX_ASSET_FAILURES as u32 + 100;
+        for id in 0..recorded {
             metrics.asset_failures.push(AssetFailure {
                 model_path: "🦀".repeat(400),
                 reference_form_id: id,
@@ -1039,9 +1049,14 @@ mod tests {
         }
         let export = streaming_snapshot(&metrics);
         let failures = export["recent_asset_failures"].as_array().unwrap();
-        assert_eq!(failures.len(), 32);
-        assert_eq!(failures[0]["reference_form_id"], 99);
-        assert_eq!(export["omitted_asset_failures"], 68);
+        assert_eq!(failures.len(), MAX_FAILURES);
+        assert_eq!(failures[0]["reference_form_id"], recorded - 1);
+        assert_eq!(export["asset_failures_total"], recorded);
+        assert_eq!(
+            export["retained_asset_failures"],
+            crate::streaming::MAX_ASSET_FAILURES
+        );
+        assert_eq!(export["omitted_asset_failures"], recorded - 32);
         assert!(failures[0]["model_path"].as_str().unwrap().len() <= MAX_FIELD_BYTES);
         assert_eq!(
             failures[0]["dependency_chain"].as_array().unwrap().len(),

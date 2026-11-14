@@ -41,7 +41,12 @@ rotation. In the Riverwood Trader (`RiverwoodRiverwoodTrader`) it meets `Counter
 (90 degree root) matches the footprint of `sc_spire04.nif` (identity root) to within 18 units only
 without it, against 106 units with it. About 740 of the 18,862 meshes in `Skyrim - Meshes0.bsa`
 author a root rotation, 391 of them under `architecture/`. Bone nodes read from a separate
-skeleton NIF are unchanged.
+skeleton NIF are unchanged. The rule is keyed on block 0 alone, not on the file extension: a
+distant-LOD file (`.btr`, `.BTO`) that reaches this conversion gets the same identity root and
+the same collision frame as a `.nif`. Placement is the consumer's job either way — a reference
+supplies the transform for a placed static, and a LOD tile is placed from worldspace grid
+coordinates with the LOD origin and stride — so a root transform carried into the GLB would be
+applied on top of that placement instead of being replaced by it.
 
 ---
 

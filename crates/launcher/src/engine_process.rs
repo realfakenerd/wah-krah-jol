@@ -6,14 +6,20 @@
 //! it shows the file's tail as-is: it never matches on the engine's wording.
 
 use bevy::prelude::Resource;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The engine's log (stdout and stderr) is `<prefix><launcher pid>.log` in the temp directory,
-/// truncated at each launch. The launcher's own id keeps two launchers from sharing one log.
+/// The engine's log (stdout and stderr) is `<prefix><launcher pid>-<launch>.log` in the temp
+/// directory, `launch` counting this launcher's launches. [`EngineProcess::spawn`] creates it
+/// with `create_new`, so a file or symlink already at the name is left alone and the next name
+/// is used instead.
 pub const STDERR_LOG_PREFIX: &str = "mudcrab-engine-";
+/// Names [`EngineProcess::spawn`] tries for the log (the requested one, then `-1`, `-2`...)
+/// before it gives up and inherits the engine's streams instead.
+pub const LOG_NAME_ATTEMPTS: u32 = 16;
 /// Bytes read from the end of the log when the engine stops early.
 pub const TAIL_MAX_BYTES: u64 = 8 * 1024;
 /// Log lines shown when the engine stops early.
@@ -21,9 +27,16 @@ pub const SHOWN_LINES: usize = 12;
 /// A longer log line is cut, so one line cannot fill the status text.
 const MAX_LINE_CHARS: usize = 300;
 
-/// Where the launcher writes the engine's stdout and stderr.
+/// The first name tried for the launcher's engine log: unique per process and per launch, so
+/// two launchers or two launches here never aim at one log. It is a name, not a guarantee:
+/// `spawn` takes it only if it does not exist.
 pub fn stderr_log_path() -> PathBuf {
-    std::env::temp_dir().join(format!("{STDERR_LOG_PREFIX}{}.log", std::process::id()))
+    static NEXT_LAUNCH: AtomicU32 = AtomicU32::new(0);
+    let launch = NEXT_LAUNCH.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{STDERR_LOG_PREFIX}{}-{launch}.log",
+        std::process::id()
+    ))
 }
 
 /// Strips ANSI escape sequences (the engine's log colours), trims trailing whitespace and cuts
@@ -126,30 +139,79 @@ Full log: {}",
 #[derive(Resource)]
 pub struct EngineProcess {
     child: Child,
-    /// `None` when the log file could not be created and both streams were inherited instead.
+    /// `None` when the log file could not be created and both streams were inherited instead;
+    /// `log_error` then says why.
     log: Option<PathBuf>,
+    /// Why no log file was created: [`EngineProcess::poll`] adds it to the failure message, so a
+    /// log the launcher could not open is never mistaken for one the engine did not fill.
+    log_error: Option<String>,
+}
+
+/// The log name to try, numbered by `attempt`: `engine.log`'s siblings are `engine-1.log`,
+/// `engine-2.log`... (`attempt` 0 is `path` itself).
+fn log_candidate(path: &Path, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        return path.to_path_buf();
+    }
+    let mut name = path
+        .file_stem()
+        .map(|stem| stem.to_os_string())
+        .unwrap_or_default();
+    name.push(format!("-{attempt}"));
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    path.with_file_name(name)
+}
+
+/// Creates a fresh log file at `path`, or at the first numbered sibling that does not exist.
+/// `create_new` never truncates an existing file and never follows a symlink at the name, so a
+/// file someone else placed there is left untouched. Fails once every name is taken.
+fn create_log(path: &Path) -> io::Result<(File, PathBuf)> {
+    for attempt in 0..LOG_NAME_ATTEMPTS {
+        let candidate = log_candidate(path, attempt);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "all {LOG_NAME_ATTEMPTS} candidate names for {} are taken",
+        path.display()
+    )))
 }
 
 impl EngineProcess {
-    /// Spawns `command` with its stdout and stderr written to `log` (created or truncated). If
-    /// the file cannot be created, both streams are inherited and no error text will be shown; if
-    /// only its second handle fails, stdout alone is inherited.
+    /// Spawns `command` with its stdout and stderr written to a fresh log file at `log` (or its
+    /// first free `-<n>` sibling, see [`create_log`]). If no file can be created, both streams
+    /// are inherited and no error text will be shown; if only its second handle fails, stdout
+    /// alone is inherited.
     pub fn spawn(mut command: Command, log: &Path) -> io::Result<Self> {
-        let log = match File::create(log) {
-            Ok(file) => {
+        let (log, log_error) = match create_log(log) {
+            Ok((file, path)) => {
                 let stdout = file
                     .try_clone()
                     .map_or_else(|_| Stdio::inherit(), Stdio::from);
                 command.stdout(stdout).stderr(Stdio::from(file));
-                Some(log.to_path_buf())
+                (Some(path), None)
             }
-            Err(_) => {
+            Err(error) => {
                 command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-                None
+                (None, Some(error.to_string()))
             }
         };
         let child = command.spawn()?;
-        Ok(Self { child, log })
+        Ok(Self {
+            child,
+            log,
+            log_error,
+        })
     }
 
     pub fn id(&self) -> u32 {
@@ -173,11 +235,13 @@ impl EngineProcess {
             }
             _ => Vec::new(),
         };
-        Some(engine_exit_message(
-            status.code(),
-            &lines,
-            self.log.as_deref(),
-        ))
+        let mut message = engine_exit_message(status.code(), &lines, self.log.as_deref());
+        if !status.success()
+            && let Some(error) = &self.log_error
+        {
+            message.push_str(&format!("\nThe log file could not be created: {error}"));
+        }
+        Some(message)
     }
 }
 
@@ -194,6 +258,14 @@ mod tests {
             "mudcrab-launcher-test-{}-{name}",
             std::process::id()
         ))
+    }
+
+    /// Removes `path` and its numbered log siblings: a file left by an earlier run must not
+    /// decide which name this run's spawn gets.
+    fn remove_test_logs(path: &Path) {
+        for attempt in 0..LOG_NAME_ATTEMPTS {
+            let _ = std::fs::remove_file(log_candidate(path, attempt));
+        }
     }
 
     #[test]
@@ -253,12 +325,15 @@ Full log: engine.log"
     }
 
     #[test]
-    fn each_launcher_writes_its_own_engine_log() {
-        let path = stderr_log_path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(
-            name,
-            format!("{STDERR_LOG_PREFIX}{}.log", std::process::id())
+    fn each_launch_writes_its_own_engine_log() {
+        let first = stderr_log_path();
+        let second = stderr_log_path();
+        assert_ne!(first, second, "two launches must not share a name");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let own = format!("{STDERR_LOG_PREFIX}{}-", std::process::id());
+        assert!(
+            name.starts_with(&own) && name.ends_with(".log"),
+            "{name} is not this launcher's log name"
         );
     }
 
@@ -351,7 +426,7 @@ Full log: engine.log"
     #[test]
     fn a_real_child_that_fails_reports_its_code_output_and_log() {
         let log = test_path("child.log");
-        std::fs::write(&log, "left over from an earlier launch\n").unwrap();
+        remove_test_logs(&log);
         let mut engine = EngineProcess::spawn(failing_command(), &log).expect("spawn the shell");
         let message = wait_for_exit(&mut engine);
         std::fs::remove_file(&log).unwrap();
@@ -365,12 +440,45 @@ Full log: engine.log"
     }
 
     #[test]
+    fn an_existing_file_at_the_log_name_is_not_opened_or_truncated() {
+        let taken = test_path("taken.log");
+        remove_test_logs(&taken);
+        std::fs::write(&taken, "someone else's file\n").unwrap();
+        let mut engine = EngineProcess::spawn(failing_command(), &taken).expect("spawn the shell");
+        let used = engine.log.clone().expect("a log file was created");
+        let message = wait_for_exit(&mut engine);
+        let kept = std::fs::read_to_string(&taken).unwrap();
+        // Cleanup first so a failure below reports the property, not a missing file (`used` is
+        // the same path as `taken` when the log name was not left alone).
+        let _ = std::fs::remove_file(&taken);
+        let _ = std::fs::remove_file(&used);
+        assert_eq!(
+            kept, "someone else's file\n",
+            "a file already at the log name must keep its contents"
+        );
+        assert_eq!(used, log_candidate(&taken, 1), "the next name is used");
+        assert_eq!(
+            message,
+            format!(
+                "The engine stopped (exit code 2):\nloading data\nengine refused to start\nFull log: {}",
+                used.display()
+            )
+        );
+    }
+
+    #[test]
     fn without_a_log_file_the_child_still_runs_and_reports_its_code() {
         let log = test_path("missing-dir").join("child.log");
         let mut engine = EngineProcess::spawn(failing_command(), &log).expect("spawn the shell");
-        assert_eq!(
-            wait_for_exit(&mut engine),
-            "The engine stopped (exit code 2) without an error message."
+        assert!(engine.log.is_none(), "no log could be created");
+        let message = wait_for_exit(&mut engine);
+        assert!(
+            message.starts_with("The engine stopped (exit code 2) without an error message."),
+            "{message}"
+        );
+        assert!(
+            message.contains("The log file could not be created: "),
+            "the missing log is named: {message}"
         );
     }
 }

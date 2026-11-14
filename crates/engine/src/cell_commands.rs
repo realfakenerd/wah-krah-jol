@@ -6,6 +6,10 @@
 //! streaming plugin loads the new area around the camera (re-centring its render origin as
 //! needed). Skyrim puts the player on the cell's COC marker; the converter does not export those
 //! yet, so the player lands on the cell centre instead.
+//!
+//! Both are refused from inside an interior cell, and from a worldspace other than the configured
+//! one: the streaming planner keeps only the active space resident, so the render-space landing
+//! point would be empty air with nothing under it.
 
 use bevy::prelude::*;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -14,7 +18,7 @@ use crate::{
     config::EngineConfig,
     console::{AppConsoleExt, ConsoleCommand},
     physics::{LookIntent, TeleportPlayer},
-    streaming::RenderOrigin,
+    streaming::{ActiveSpace, RenderOrigin},
     world::{cache::CellCache, components::CELL_SIZE},
 };
 
@@ -35,7 +39,7 @@ fn center_on_exterior_command() -> ConsoleCommand {
             let (worldspace_id, connection) = open_world(world)?;
             let cell_id = find_exterior_cell(&connection, worldspace_id, grid_x, grid_y)?
                 .ok_or_else(|| format!("no exterior cell at {grid_x} {grid_y}"))?;
-            teleport_to_cell(world, cell_id, grid_x, grid_y)?;
+            teleport_to_cell(world, cell_id, grid_x, grid_y, worldspace_id)?;
             Ok(format!("moved to exterior cell {grid_x} {grid_y}"))
         }),
     }
@@ -57,7 +61,7 @@ fn center_on_cell_command() -> ConsoleCommand {
             // named cell unless the database holds two cells for it.
             let cell_id =
                 find_exterior_cell(&connection, worldspace_id, grid_x, grid_y)?.unwrap_or(cell.id);
-            teleport_to_cell(world, cell_id, grid_x, grid_y)?;
+            teleport_to_cell(world, cell_id, grid_x, grid_y, worldspace_id)?;
             Ok(format!("moved to {name} (exterior cell {grid_x} {grid_y})"))
         }),
     }
@@ -189,12 +193,31 @@ pub const LANDING_CLEARANCE: f32 = 16.0;
 /// The teleport itself, kept apart so it can be swapped for another way of placing the player.
 /// A cell with no terrain in the cache is refused rather than guessed at: worldspaces sit
 /// thousands of units above or below 0, so a made-up height can drop the player under the world.
+/// The player's space is checked first, because the landing point is relative to the render origin
+/// of the space the planner is streaming: from an interior, or from a worldspace the cell lookup
+/// did not use, the teleport would move the camera into empty air with no cell resident there.
 fn teleport_to_cell(
     world: &mut World,
     cell_id: u32,
     grid_x: i32,
     grid_y: i32,
+    configured_worldspace: u32,
 ) -> Result<(), String> {
+    let space = *world
+        .get_resource::<ActiveSpace>()
+        .ok_or("no world is streaming in this run")?;
+    if let Some(interior) = space.interior {
+        return Err(format!(
+            "cannot coc/coe from inside an interior cell ({interior}); leave the interior first"
+        ));
+    }
+    let active_worldspace = space.exterior_worldspace(configured_worldspace);
+    if active_worldspace != configured_worldspace {
+        return Err(format!(
+            "cannot coc/coe in worldspace {active_worldspace:08X}: this run looks cells up in \
+             worldspace {configured_worldspace:08X}"
+        ));
+    }
     let origin = world
         .get_resource::<RenderOrigin>()
         .ok_or("no world is streaming in this run")?
@@ -452,6 +475,7 @@ mod tests {
                     ..default()
                 })
                 .insert_resource(RenderOrigin(IVec2::new(4, -12)))
+                .init_resource::<ActiveSpace>()
                 .init_resource::<ConsoleState>();
             register_cell_commands(app);
         });
@@ -534,6 +558,57 @@ mod tests {
         let at = camera_position(&mut app);
         let camera = Vec3::new(2048.0, 156.0, -2048.0);
         assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
+    }
+
+    /// From inside an interior the planner keeps only that interior resident, so a render-relative
+    /// exterior landing would be empty air. Both commands must refuse instead of teleporting.
+    #[test]
+    fn coc_and_coe_refuse_from_inside_an_interior() {
+        let directory = database();
+        let mut app = command_app(&directory);
+        app.insert_resource(ActiveSpace {
+            worldspace_id: Some(60),
+            interior: Some(3),
+        });
+        app.update();
+        let before = camera_position(&mut app);
+        execute_line(app.world_mut(), "coe 5 -12");
+        execute_line(app.world_mut(), "coc riverwood");
+        app.update();
+        assert_eq!(camera_position(&mut app), before);
+        let text = scrollback(&app);
+        assert_eq!(
+            text.matches("cannot coc/coe from inside an interior cell")
+                .count(),
+            2,
+            "{text}"
+        );
+        assert!(text.contains("leave the interior first"), "{text}");
+    }
+
+    /// `coe` and `coc` look cells up in the configured worldspace, while the planner streams the
+    /// active one: a teleport in another worldspace would also land in empty space.
+    #[test]
+    fn coc_and_coe_refuse_in_a_worldspace_they_do_not_look_up() {
+        let directory = database();
+        let mut app = command_app(&directory);
+        app.insert_resource(ActiveSpace {
+            worldspace_id: Some(61),
+            interior: None,
+        });
+        app.update();
+        let before = camera_position(&mut app);
+        execute_line(app.world_mut(), "coe 5 -12");
+        execute_line(app.world_mut(), "coc riverwood");
+        app.update();
+        assert_eq!(camera_position(&mut app), before);
+        let text = scrollback(&app);
+        assert_eq!(
+            text.matches("cannot coc/coe in worldspace").count(),
+            2,
+            "{text}"
+        );
+        assert!(text.contains("looks cells up in worldspace"), "{text}");
     }
 
     #[derive(Resource)]

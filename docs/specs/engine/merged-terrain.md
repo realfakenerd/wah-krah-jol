@@ -85,6 +85,30 @@ usage), one sampler, the id-to-(class, layer) table as a storage buffer and the 
 six classes. The sampled array is data, so every sample is `textureSampleGrad` with derivatives of
 the shared UV computed once.
 
+Near and merged full terrain use the normal texture's alpha as a specular-intensity mask.
+The shader blends it with the same paint weights and normalization as the surface colour,
+then multiplies Bevy's dielectric reflectance by the square root of that mask. Since Bevy
+uses `F0 = 0.16 * reflectance²`, this scales F0 linearly rather than squaring the mask.
+A layer without a normal map contributes zero mask and its existing flat tangent normal;
+that is a conservative engine fallback, not an established Skyrim missing-map default.
+Normals without an alpha channel sample alpha as one.
+
+This is a PBR approximation. Perceptual roughness remains 0.92, metallic remains zero,
+and the base reflectance remains Bevy's 0.5 default before masking. Those are existing
+engine choices, not Skyrim material constants. The normal sample supplies both its normal
+and mask, without additional texture reads. Diffuse alpha is not used as the specular mask.
+
+The material distinction follows the GPL-3.0 Community Shaders contributors'
+[landscape normal-alpha blending and specular accumulation](https://github.com/community-shaders/skyrim-community-shaders/blob/e53c0a1ffaa01199490c6097a7dabb559932a88e/package/Shaders/Lighting.hlsl#L1192).
+Skyrim's ordinary landscape path uses a Blinn-Phong lobe with a separately blended LTEX
+SNAM exponent; this change does not implement that lighting function or infer roughness
+from SNAM. The current runtime texture catalog does not expose that preserved raw field.
+Partial masks scale F0, not the complete GGX lobe, and also affect Bevy's indirect energy
+redistribution. Snow-specific rules, TXST specular flags, native lighting units and colour
+domain, weather wetness, and distant LOD's specular suppression/fade remain outside this
+bridge. It affects snow layers as well as dry ground and requires visual verification in
+both. True distant LOD still uses its separate stock-material path.
+
 Back faces match today's quadrant meshes: those carry tangents, so Bevy never flips their normal,
 while a mesh without tangents has it flipped on a back face. The shader therefore reports every
 fragment as a front face to Bevy's input builder, and terrain is lit by its interpolated normal

@@ -53,15 +53,24 @@ struct TerrainSettings {
 // the tangent frame's +Y. One constant, settled by an A/B render of lit slopes.
 const NORMAL_GREEN_SIGN: f32 = -1.0;
 
-// One layer's tangent-space normal, or straight up when the layer has no map bound. The z
-// component is rebuilt from x and y, so the map's blue channel does not matter.
-fn layer_normal(map: texture_2d<f32>, uv: vec2<f32>, present: f32) -> vec3<f32> {
+// xyz = tangent-space normal, w = authored specular intensity. Skyrim landscape uses normal
+// alpha, independently of diffuse alpha and the LTEX exponent: Community Shaders (GPL-3.0),
+// Lighting.hlsl at e53c0a1ffaa01199490c6097a7dabb559932a88e, lines 1192-1357 and 1968-1976.
+// Rebuild z as before; a missing map keeps the geometric normal and contributes no specular mask.
+fn layer_surface(map: texture_2d<f32>, uv: vec2<f32>, present: f32) -> vec4<f32> {
     if present < 0.5 {
-        return vec3<f32>(0.0, 0.0, 1.0);
+        return vec4<f32>(0.0, 0.0, 1.0, 0.0);
     }
-    let xy = textureSample(map, layer_sampler, uv).xy * 2.0 - 1.0;
+    let sample = textureSample(map, layer_sampler, uv);
+    let xy = sample.xy * 2.0 - 1.0;
     let tilt = vec2<f32>(xy.x, NORMAL_GREEN_SIGN * xy.y);
-    return vec3<f32>(tilt, sqrt(max(0.0, 1.0 - dot(tilt, tilt))));
+    return vec4<f32>(tilt, sqrt(max(0.0, 1.0 - dot(tilt, tilt))), sample.a);
+}
+
+// A PBR bridge, not Skyrim's Blinn-Phong lobe: Bevy uses F0 = 0.16 * reflectance^2,
+// so sqrt(mask) scales F0 linearly by the normalized authored intensity. Keep roughness separate.
+fn terrain_reflectance(reflectance: vec3<f32>, mask_sum: f32, total: f32) -> vec3<f32> {
+    return reflectance * sqrt(clamp(mask_sum / total, 0.0, 1.0));
 }
 
 // The terrain's tangent frame. Its texture coordinates run exactly along world +X (u) and world -Z
@@ -162,16 +171,19 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_input.material.base_color *= color / total;
     // The layers' normal maps, blended by the same weights in the shared tangent frame and turned
     // into a world normal once. Only materials with at least one map do the extra reads.
+    var specular_mask = 0.0;
     if dot(terrain.normal_layers_0, vec4<f32>(1.0)) + terrain.normal_layers_1.x + terrain.normal_layers_1.y > 0.5 {
-        var tangent_normal = layer_normal(normal_0, uv, terrain.normal_layers_0.x) * weights[0];
-        tangent_normal += layer_normal(normal_1, uv, terrain.normal_layers_0.y) * weights[1];
-        tangent_normal += layer_normal(normal_2, uv, terrain.normal_layers_0.z) * weights[2];
-        tangent_normal += layer_normal(normal_3, uv, terrain.normal_layers_0.w) * weights[3];
-        tangent_normal += layer_normal(normal_4, uv, terrain.normal_layers_1.x) * weights[4];
-        tangent_normal += layer_normal(normal_5, uv, terrain.normal_layers_1.y) * weights[5];
+        var surface = layer_surface(normal_0, uv, terrain.normal_layers_0.x) * weights[0];
+        surface += layer_surface(normal_1, uv, terrain.normal_layers_0.y) * weights[1];
+        surface += layer_surface(normal_2, uv, terrain.normal_layers_0.z) * weights[2];
+        surface += layer_surface(normal_3, uv, terrain.normal_layers_0.w) * weights[3];
+        surface += layer_surface(normal_4, uv, terrain.normal_layers_1.x) * weights[4];
+        surface += layer_surface(normal_5, uv, terrain.normal_layers_1.y) * weights[5];
+        specular_mask = surface.w;
         let geometric = normalize(pbr_input.world_normal);
-        pbr_input.N = normalize(terrain_tbn(geometric) * normalize(tangent_normal));
+        pbr_input.N = normalize(terrain_tbn(geometric) * normalize(surface.xyz));
     }
+    pbr_input.material.reflectance = terrain_reflectance(pbr_input.material.reflectance, specular_mask, total);
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);

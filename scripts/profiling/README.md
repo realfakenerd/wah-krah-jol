@@ -115,7 +115,8 @@ falls back to the capture timeout, so keep it separate from GPU capture.
 
 For native HUD encoder counters, use a separate build without application
 timestamp-query features. `native-hud-counters.patch` contains the diagnostic
-change tested against the profiling PR's source. Check its application first:
+change tested against revision `f9653bfd`. It does not apply to `64108a1c` or `5840f49f`;
+refresh it for those revisions before building. Check its application first:
 
 ```sh
 git apply --check scripts/profiling/native-hud-counters.patch

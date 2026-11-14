@@ -11,7 +11,7 @@
 | **`.bsa` / `.ba2`**          | Extracted VFS Hierarchy            | Unpacked file system access                                 | `flate2`, `lz4_flex`          |
 | **`.esm` / `.esp` / `.esl`** | **`SQLite 3` (`skyrim_world.db`)** | Conflict-resolved record database & R-Tree spatial indexing | `rusqlite`                     |
 | **`.nif`**                   | **`glTF 2.0` (`.glb`)**            | Geometry, PBR materials, skeletal skinning & joints         | `mesh_tools` / `gltf` crate   |
-| **`.dds` (BC1-BC7)**         | **`KTX2` Basis Universal**         | Supercompressed GPU texture streaming                       | `ddsfile`, `basis-universal`  |
+| **`.dds` (BC1-BC7)**         | **`KTX2` native / UASTC**          | Native preservation, BC7 encoding or UASTC fallback           | `ddsfile`, `intel_tex_2`, `basis-universal` |
 | **`.pex` (Papyrus)**         | **`Luau` Scripts**                 | Sandboxed, high-performance scripting                       | Papyrus AST Decompiler ➔ Luau |
 
 ---
@@ -27,7 +27,7 @@ The integration report distinguishes conversion-closure failures from references
 - BSA v104/v105 and optional BA2 GNRL extraction use a read-only memory map, path-traversal protection, bounded archive concurrency, deterministic overlay order, and atomic output publication.
 - ESM/ESP/ESL records are merged in `plugins.txt` priority order with regular/light FormID remapping, deletion handling, semantic world tables, exterior R-Tree indexing, and an rkyv cell cache.
 - Static and skinned NIF geometry is exported to GLB. Collision-only and control-only NIFs are preserved as deterministic empty-scene GLBs, while files that declare unconvertible render geometry remain hard failures. Diffuse, normal, glow, and specular/environment paths are normalized to the generated KTX2 hierarchy and core glTF metallic-roughness materials.
-- 2D BC1–BC7 DDS textures are decoded and encoded as runtime-compatible UASTC KTX2. Color, normal and data transfer functions are selected from material/database slot semantics, and authored mip levels and alpha are preserved.
+- Compatible DDS formats retain native blocks in KTX2. Eligible packed 2D RGB(A) inputs encode to BC7 on CPU; remaining decodable inputs use UASTC fallback. Slot semantics select transfer functions, and authored mip levels and topology are retained. See the [desktop texture contract](../adr/0014-phase1-desktop-texture-contract.md).
 - Skyrim PEX bytecode is parsed, verified, lowered to deterministic Luau state-machine modules, and backed by the sandboxed Papyrus compatibility runtime in `crates/engine`.
 - Conversion work is bounded by `cpu_jobs` and `io_jobs`; cache hits require matching source, configuration, output size, and output SHA-256. Archive ingestion is cached separately as deduplicated SHA-256 blobs, so unchanged BSA/BA2 files rebuild the VFS without decompression.
 
@@ -70,8 +70,8 @@ Use `--invalidate-cache` to force fresh archive extraction and asset conversion.
 
 ### 1.4 Texture Compressor (`DDS_TO_KTX2`)
 
-- Transcode DirectDraw Surface files into supercompressed **Basis Universal KTX2**.
-- Target runtime transcoding for Desktop (BC7), Mobile (ASTC), and Web (ETC2).
+- Write DDS textures as KTX2 containing native payloads, CPU-encoded BC7 or UASTC fallback. Native BC requires compatible GPU support; only UASTC payloads use runtime transcoding.
+- Mobile ASTC and web ETC2 output/loading are not demonstrated. A maintainer approved Route B in [#162](https://github.com/Mudcrab-Team/mudcrab/issues/162#issuecomment-6694524381), deferring the portable profile to multiplatform delivery. [ADR-0014](../adr/0014-phase1-desktop-texture-contract.md) remains proposed for repository adoption; implementation and target validation are tracked in [#548](https://github.com/Mudcrab-Team/mudcrab/issues/548), which is not a Phase 1 blocker.
 
 ### 1.5 Papyrus Bytecode Transpiler (`PEX_TO_LUA`)
 

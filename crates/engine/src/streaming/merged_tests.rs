@@ -715,7 +715,9 @@ fn spawn_merged_cell(
         true,
     );
     let mut snapshot = cached_snapshot(&record);
-    snapshot.water_height = Some(12.0);
+    snapshot.water_height = Some(500.0);
+    // Deliberately differ from the drawn merged height field: water coverage must use the mesh.
+    snapshot.heights.fill(1000.0);
     let classes = Arc::new(TerrainClasses::from_table(vanilla_table(9)).unwrap());
     spawn_cell(
         &mut commands,
@@ -796,6 +798,15 @@ fn a_merged_cell_spawns_one_terrain_entity_with_one_collider() {
         .iter(world)
         .count();
     assert_eq!(water, 1, "the cell's water still comes from its snapshot");
+    let mut bodies = world.query::<&FlatWaterBody>();
+    let sample = crate::world::water::water_at_point(
+        bodies.iter(world),
+        60,
+        WorldPosition::from_creation_units(Vec3::new(64.0, 64.0, 0.0)),
+    )
+    .expect("the drawn merged LAND is below water, although the cached LAND is above it");
+    assert_eq!(sample.cell_id, CELL);
+    assert_eq!(sample.surface.height, 500.0);
 
     let mut ready = world.query_filtered::<(
         &MergedTerrainCoverage,

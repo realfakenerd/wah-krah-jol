@@ -361,7 +361,9 @@ fn rotated_rigid_body_t_rotates_the_tensor_and_moves_the_center_into_the_shape_f
 #[test]
 fn the_root_nodes_own_transform_moves_neither_render_nodes_nor_collision() {
     // As countercornerin01.nif: the root BSFadeNode is rotated 90 degrees about Z (rows
-    // (0, -1, 0), (1, 0, 0), (0, 0, 1)); here it is also translated and scaled.
+    // (0, -1, 0), (1, 0, 0), (0, 0, 1)); here it is also translated and scaled. The vendor's
+    // `the_model_layer_keeps_the_authored_root_transform` pins the other half of this split:
+    // the model still carries the authored transform, and only this converter drops it.
     let root = RootTransform {
         translation: [10.0, 20.0, 30.0],
         rotation: [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
@@ -393,6 +395,49 @@ fn the_root_nodes_own_transform_moves_neither_render_nodes_nor_collision() {
         .map(|axis| points.iter().map(|p| p[axis]).sum::<f32>() / points.len() as f32)
         .collect();
     assert_close(&centroid, &[70.0, 0.0, 0.0], "shape centroid");
+}
+
+#[test]
+fn no_extension_keeps_the_root_transform() {
+    // The rule above is keyed on block 0, not on the file name. A distant-LOD file reaches this
+    // same entry point, and the placing reference owns its frame too, so it gets the identity
+    // root and the identity collision frame that a .nif gets. Nothing here may branch on the
+    // extension, including its case.
+    for extension in ["nif", "btr", "BTO"] {
+        let root = RootTransform {
+            translation: [10.0, 20.0, 30.0],
+            rotation: [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            scale: 2.0,
+        };
+        let mut body = crate_body();
+        body.transform = Some(([1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]));
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join(format!("sc_spire04_lod.{extension}"));
+        let output = directory
+            .path()
+            .join(format!("sc_spire04_lod.{extension}.glb"));
+        fs::write(
+            &input,
+            static_shape_with_root_transform(&QUAD, &[body], root).unwrap(),
+        )
+        .unwrap();
+        MeshConverter::convert_nif_to_glb_with_skeleton(&input, &output, None).unwrap();
+        let (gltf, asset) = read_glb(&output);
+
+        for field in ["rotation", "translation", "scale", "matrix"] {
+            assert!(
+                gltf["nodes"][0].get(field).is_none(),
+                "{extension}: root {field}"
+            );
+        }
+        let CollisionShape::Hull { points } = &asset.shapes[0] else {
+            panic!("{extension}: expected a hull");
+        };
+        let centroid: Vec<f32> = (0..3)
+            .map(|axis| points.iter().map(|p| p[axis]).sum::<f32>() / points.len() as f32)
+            .collect();
+        assert_close(&centroid, &[70.0, 0.0, 0.0], extension);
+    }
 }
 
 /// Rewrites the GLB's JSON chunk, keeping its binary chunk.

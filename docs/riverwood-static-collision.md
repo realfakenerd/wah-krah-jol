@@ -5,6 +5,32 @@ collider is considered for placed `STAT`, `TREE`, and `FURN` records. Placed
 `FURN` uses authored NIF collision only. `MISC`, `FLOR`, `DOOR`, and other
 movable or interactive records remain outside this fixed-static path.
 
+`ACTI` uses authored-only rest-pose collision: shapes owned exclusively by
+dynamic bodies are omitted, while fixed, keyframed and unowned shapes retain
+the existing fixed fallback. It receives no render-mesh proxy.
+
+For `CONT`, the first supported subset is exactly `meshes/clutter/barrel01.glb`,
+`meshes/clutter/tgbarrel01.glb`, `meshes/clutter/sovngarde/sovbarrel01.glb`, and
+`meshes/clutter/sburialurn01.glb`. Admission requires version 2 body ownership,
+no converter skips, and one massless `fixed` body on node 0, with a nonempty
+target and layer 1 (`STATIC`), owning every shape. Missing bindings, unowned
+shapes, multiple bodies, other layers, dynamic/keyframed bodies and version 1
+shapes are skipped. Authored absence stays passable; missing collision extras
+receive no proxy. Other container paths remain excluded and counted by the
+authored-exclusion diagnostic. No schema change or reconversion is required
+when the existing GLB satisfies this contract.
+
+The four source NIFs in registered pack `user-testing-main-b5259d33` were
+inspected read-only: each has one root collision body and no controller,
+interpolator or constraint blocks. Its manifest SHA-256 is
+`8a5e022024eae8c0abc1e3c3317c8f0135cd3f172175aa88d1e749df92d1d6a4`;
+the owner's converter receipt identifies `b5259d33a73e1df730f0730866595fd4cdaae0e3`.
+The inventory has 4,075 references to these models, including disabled references;
+this is not a live collider count. Chests and other urns remain deferred:
+`UpperChest01` has a controller-driven lid despite `fixed`/`STATIC` metadata.
+This path policy does not establish arbitrary mod/script behavior. Source audit
+and synthetic physics tests do not establish game-runtime or performance acceptance.
+
 Converted GLBs now carry a versioned `mudcrabCollision` value in scene
 extras. The converter follows each NIF `bhkCollisionObject` through its rigid
 body and shape references. It decodes compressed meshes, capsules, boxes,
@@ -59,9 +85,10 @@ limits. A placed reference whose base record type is movable (`MISC`, `WEAP`,
 carries a body of kind `dynamic` becomes a dynamic Rapier body on the
 reference entity, using the authored mass properties and falling and colliding
 with the player, tankards and other clutter; a non-convex body uses one convex
-hull instead. Everything else is unchanged: fixed bodies keep today's fixed path, the record
-types deferred for later (`CONT`, `ACTI`, `FLOR` and the rest) keep no collider,
-as today, a version 1 asset spawns nothing new, and the body despawns with its
+hull instead. Fixed bodies on movable record types receive no collider. The fixed
+tiers and audited container subset above are separate; other deferred types
+(`FLOR`, `DOOR`, `MSTT` and the rest) keep no collider. A version 1 asset spawns
+no new dynamic body, and the body despawns with its
 cell. Two limits are deliberate for this slice: the character controller
 cannot push dynamic bodies yet, and the authored `deactivator_type` is not
 mapped, so bodies may sleep. Each body also starts asleep and stays where it

@@ -213,41 +213,41 @@ fn sample_diffuse(class_slot: u32, uv: vec2<f32>, layer: u32, ddx: vec2<f32>, dd
     }
 }
 
-// One normal map sample's xy from the class slot `class`.
-fn sample_normal_xy(class_slot: u32, uv: vec2<f32>, layer: u32, ddx: vec2<f32>, ddy: vec2<f32>) -> vec2<f32> {
+// One normal RGBA sample: xy supplies the normal and alpha supplies specular intensity.
+fn sample_normal(class_slot: u32, uv: vec2<f32>, layer: u32, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
 #ifdef TERRAIN_HAS_NORMAL_CLASSES
     switch class_slot {
 #ifdef TERRAIN_NORMAL_CLASS_0
-        case 0u: { return textureSampleGrad(normal_0, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 0u: { return textureSampleGrad(normal_0, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_1
-        case 1u: { return textureSampleGrad(normal_1, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 1u: { return textureSampleGrad(normal_1, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_2
-        case 2u: { return textureSampleGrad(normal_2, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 2u: { return textureSampleGrad(normal_2, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_3
-        case 3u: { return textureSampleGrad(normal_3, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 3u: { return textureSampleGrad(normal_3, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_4
-        case 4u: { return textureSampleGrad(normal_4, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 4u: { return textureSampleGrad(normal_4, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_5
-        case 5u: { return textureSampleGrad(normal_5, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 5u: { return textureSampleGrad(normal_5, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_6
-        case 6u: { return textureSampleGrad(normal_6, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 6u: { return textureSampleGrad(normal_6, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_7
-        case 7u: { return textureSampleGrad(normal_7, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 7u: { return textureSampleGrad(normal_7, land_sampler, uv, layer, ddx, ddy); }
 #endif
 #ifdef TERRAIN_NORMAL_CLASS_8
-        case 8u: { return textureSampleGrad(normal_8, land_sampler, uv, layer, ddx, ddy).xy; }
+        case 8u: { return textureSampleGrad(normal_8, land_sampler, uv, layer, ddx, ddy); }
 #endif
-        default: { return vec2<f32>(0.5); }
+        default: { return vec4<f32>(0.5, 0.5, 1.0, 0.0); }
     }
 #else
-    return vec2<f32>(0.5);
+    return vec4<f32>(0.5, 0.5, 1.0, 0.0);
 #endif
 }
 
@@ -257,6 +257,13 @@ fn terrain_tbn(n: vec3<f32>) -> mat3x3<f32> {
     let u_axis = vec3<f32>(1.0, 0.0, 0.0);
     let t = normalize(u_axis - n * dot(n, u_axis) + vec3<f32>(0.0, 0.0, 1.0e-6));
     return mat3x3<f32>(t, cross(n, t), n);
+}
+
+// Same PBR bridge as terrain.wgsl: normal alpha is Skyrim's specular intensity, not roughness.
+// Community Shaders (GPL-3.0), Lighting.hlsl at e53c0a1ffaa01199490c6097a7dabb559932a88e,
+// lines 1192-1357 and 1968-1976. Bevy's F0 is quadratic in reflectance, hence sqrt(mask).
+fn terrain_reflectance(reflectance: vec3<f32>, mask_sum: f32, total: f32) -> vec3<f32> {
+    return reflectance * sqrt(clamp(mask_sum / total, 0.0, 1.0));
 }
 
 fn slot_id(in: TerrainVertexOutput, slot: u32) -> u32 {
@@ -323,6 +330,7 @@ fn fragment(in: TerrainVertexOutput) -> FragmentOutput {
     var color = vec4<f32>(0.0);
     var tangent_normal = vec3<f32>(0.0);
     var any_normal = false;
+    var specular_mask = 0.0;
     for (var slot = 0u; slot < SLOT_COUNT; slot += 1u) {
         var weight = base_weight;
         if slot > 0u {
@@ -336,9 +344,11 @@ fn fragment(in: TerrainVertexOutput) -> FragmentOutput {
         color += sample_diffuse(entry.x >> 16u, uv, entry.x & 0xFFFFu, ddx, ddy) * weight;
 #ifdef TERRAIN_HAS_NORMAL_CLASSES
         if entry.y != NO_NORMAL_WORD {
-            let xy = sample_normal_xy(entry.y >> 16u, uv, entry.y & 0xFFFFu, ddx, ddy) * 2.0 - 1.0;
+            let sample = sample_normal(entry.y >> 16u, uv, entry.y & 0xFFFFu, ddx, ddy);
+            let xy = sample.xy * 2.0 - 1.0;
             let tilt = vec2<f32>(xy.x, NORMAL_GREEN_SIGN * xy.y);
             tangent_normal += vec3<f32>(tilt, sqrt(max(0.0, 1.0 - dot(tilt, tilt)))) * weight;
+            specular_mask += sample.a * weight;
             any_normal = true;
         } else {
             tangent_normal += vec3<f32>(0.0, 0.0, 1.0) * weight;
@@ -348,6 +358,7 @@ fn fragment(in: TerrainVertexOutput) -> FragmentOutput {
 #endif
     }
     pbr_input.material.base_color *= color / total;
+    pbr_input.material.reflectance = terrain_reflectance(pbr_input.material.reflectance, specular_mask, total);
     // Only a fragment that reads at least one normal map turns the blend into a world normal.
     if any_normal {
         let geometric = normalize(pbr_input.world_normal);

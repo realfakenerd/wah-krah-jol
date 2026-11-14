@@ -18,6 +18,7 @@ its own numbered file using a lightweight MADR-style format: **Status**, **Date*
 | [0010](0010-lod-chunk-payload-format.md) | LOD chunk payloads are GLB files, indexed by manifest | Proposed |
 | [0011](0011-lod-tier-selection-policy.md) | Fixed 4/8/16 tiers first; projected-size selection later | Proposed |
 | [0012](0012-billboard-atlas-layout.md) | Per-worldspace billboard atlases with gutters and layout versioning | Proposed |
+| [0014](0014-phase1-desktop-texture-contract.md) | Phase 1 desktop texture contract and portable-output deferral | Proposed; Route B scope approved by a maintainer on 2026-11-06 |
 
 ADRs 0001–0008 were produced by the synthetic fixture generator work tracked in
 [issue #2](https://github.com/Mudcrab-Team/mudcrab/issues/2). Decisions for the NIF/ESM writers

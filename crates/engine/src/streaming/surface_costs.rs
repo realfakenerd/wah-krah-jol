@@ -8,6 +8,7 @@ use crate::{
         cache::TerrainSnapshot,
         components::{TerrainPatch, WaterSurface},
         database::AssetCatalog,
+        water::FlatWater,
     },
 };
 use bevy::{
@@ -43,10 +44,8 @@ pub(crate) fn surface_resource_paths(
         }
     }
     if water
-        && terrain
-            .water_height
-            .is_some_and(|height| height.is_finite() && height.abs() < 1.0e7)
-        && let Some(water_type) = terrain.water_type_form_id
+        && let Some(surface) = FlatWater::from_terrain(terrain)
+        && let Some(water_type) = surface.water_type_form_id
     {
         paths.extend(catalog.water_flow(water_type));
     }

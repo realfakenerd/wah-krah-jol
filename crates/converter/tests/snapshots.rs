@@ -91,11 +91,7 @@ fn table_rows(connection: &Connection, table: &str, order_by: &str) -> Vec<Value
     let mut statement = connection
         .prepare(&format!("SELECT * FROM {table} ORDER BY {order_by}"))
         .unwrap();
-    let columns: Vec<String> = statement
-        .column_names()
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    let columns: Vec<String> = statement.column_names().map(str::to_owned).collect();
     statement
         .query_map([], |row| {
             let mut object = serde_json::Map::new();

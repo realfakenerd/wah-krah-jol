@@ -30,7 +30,7 @@ bevy = { version = "0.19.0", default-features = false, features = [
 
 # Scripting & Database
 mlua = { version = "0.10", features = ["luau", "luau-jit", "vendored"] }
-rusqlite = { version = "0.32", features = ["bundled-full"] }
+rusqlite = { version = "0.41", features = ["bundled-full", "fallible_uint"] }
 rkyv = { version = "0.8.18" }
 memmap2 = "0.9"
 crossbeam-channel = "0.5.16"

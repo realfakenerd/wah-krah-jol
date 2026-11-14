@@ -228,6 +228,8 @@ pub enum LandTextureFormat {
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct LandTextureArray {
     /// Path relative to the converted output root, e.g. `terrain/land-diffuse-bc1-1024.ktx2`.
+    /// [`LandTextureTable::validate`] refuses any other shape. The check reads the path string
+    /// only: a symlink at this path inside the pack can still resolve outside the pack root.
     pub path: String,
     pub usage: LandTextureUsage,
     pub format: LandTextureFormat,
@@ -373,6 +375,18 @@ pub enum TerrainMeshError {
     ArrayClass {
         array: usize,
     },
+    /// An array file's `path` is not a canonical relative path: absolute, above the root, URI
+    /// syntax, a control character or empty.
+    ArrayPath {
+        array: usize,
+        path: String,
+    },
+    /// An array file's `path` is relative, but not a `terrain/*.ktx2` file: the only shape the
+    /// converter writes, and so the only one the engine will open.
+    ArrayPathOutsideTerrain {
+        array: usize,
+        path: String,
+    },
 }
 
 impl std::fmt::Display for TerrainMeshError {
@@ -444,15 +458,58 @@ impl std::fmt::Display for TerrainMeshError {
                 f,
                 "texture array {array}: its usage and format are not a class, or the class repeats"
             ),
+            Self::ArrayPath { array, path } => write!(
+                f,
+                "texture array {array}: path {path:?} is not a relative path inside the converted pack"
+            ),
+            Self::ArrayPathOutsideTerrain { array, path } => write!(
+                f,
+                "texture array {array}: path {path:?} is not a terrain/*.ktx2 file"
+            ),
         }
     }
 }
 
 impl std::error::Error for TerrainMeshError {}
 
+/// Checks one array file's `path` is confined to the pack: a canonical relative path under
+/// `terrain/` with a `.ktx2` suffix, the only shape the converter writes. Without this the
+/// engine's `root.join(&path)` would follow `..` or an absolute path out of the asset root
+/// (`join` discards the root for a drive path), and the asset server would be handed the same
+/// escaping path. [`crate::streaming_costs::canonical_resource_key`] normalizes resource
+/// identities; require that it leaves the path unchanged because readers use the original
+/// string. The `terrain/*.ktx2` shape is this table's own: one nonempty filename directly
+/// under `terrain/`, with no intermediate directories for the OS to interpret.
+fn validate_array_path(array: usize, path: &str) -> Result<(), TerrainMeshError> {
+    let key = crate::streaming_costs::canonical_resource_key(path).map_err(|_| {
+        TerrainMeshError::ArrayPath {
+            array,
+            path: path.to_owned(),
+        }
+    })?;
+    if key != path {
+        return Err(TerrainMeshError::ArrayPath {
+            array,
+            path: path.to_owned(),
+        });
+    }
+    let terrain_ktx2 = key
+        .strip_prefix("terrain/")
+        .and_then(|file| file.strip_suffix(".ktx2"))
+        .is_some_and(|stem| !stem.is_empty() && !stem.contains('/'));
+    if !terrain_ktx2 {
+        return Err(TerrainMeshError::ArrayPathOutsideTerrain {
+            array,
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl LandTextureTable {
-    /// Checks the version, the array shapes, that entries are dense by id with no repeated
-    /// LTEX, and that every entry names an existing array layer.
+    /// Checks the version, the array shapes, that every array path has the one shape the
+    /// converter writes (a lexical check, see [`LandTextureArray::path`]), that entries are dense by id with no repeated LTEX, and that
+    /// every entry names an existing array layer.
     pub fn validate(&self) -> Result<(), TerrainMeshError> {
         if self.format_version != TERRAIN_MESH_FORMAT_VERSION {
             return Err(TerrainMeshError::FormatVersion {
@@ -461,6 +518,7 @@ impl LandTextureTable {
         }
         let mut classes = std::collections::HashSet::new();
         for (array, file) in self.arrays.iter().enumerate() {
+            validate_array_path(array, &file.path)?;
             let formats = match file.usage {
                 LandTextureUsage::DiffuseSrgb => DIFFUSE_FORMATS,
                 LandTextureUsage::NormalLinear => NORMAL_FORMATS,
@@ -831,6 +889,111 @@ mod tests {
         assert!(json.contains("\"diffuse_srgb\""), "{json}");
         let typo = json.replace("diffuse_srgb", "diffuse_srbg");
         assert!(serde_json::from_str::<LandTextureTable>(&typo).is_err());
+    }
+
+    /// Absolute, drive, UNC, parent and encoded paths are refused before any reader opens them.
+    #[test]
+    fn validate_refuses_array_paths_that_leave_the_pack() {
+        table(3).validate().unwrap();
+        // Forms that would resolve outside the converted output root: `..` escapes on every
+        // platform, and Windows `join` discards the root for a drive-absolute path.
+        for escaped in [
+            "",
+            "../x.ktx2",
+            "terrain/../../x.ktx2",
+            "terrain\\..\\x.ktx2",
+            "/terrain/x.ktx2",
+            "C:/x.ktx2",
+            "C:\\x.ktx2",
+            "C:terrain/x.ktx2",
+            "\\terrain\\x.ktx2",
+            "\\\\host\\share\\x.ktx2",
+            "\\\\?\\C:\\terrain\\x.ktx2",
+            "//host/share/terrain/x.ktx2",
+            "terrain/x.ktx2:stream",
+            "terrain/%2e%2e/x.ktx2",
+            "terrain/x.ktx2?query",
+            "terrain/x.ktx2#label",
+            "terrain/x.ktx2\0",
+        ] {
+            let mut bad = table(3);
+            bad.arrays[0].path = escaped.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPath {
+                    array: 0,
+                    path: escaped.into()
+                }),
+                "{escaped:?} must be refused"
+            );
+        }
+        // Relative, but not the shape the converter writes: the engine would open a path the
+        // pack does not have.
+        for elsewhere in ["textures/x.ktx2", "terrain/x.dds", "terrain/x", "x.ktx2"] {
+            let mut bad = table(3);
+            bad.arrays[0].path = elsewhere.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPathOutsideTerrain {
+                    array: 0,
+                    path: elsewhere.into()
+                }),
+                "{elsewhere:?} must be refused"
+            );
+        }
+    }
+
+    /// A path that only matches after normalising is refused as written, unused arrays included.
+    #[test]
+    fn validate_refuses_normalized_array_paths_before_readers_use_the_original() {
+        for path in [
+            "terrain\\x.ktx2",
+            "TERRAIN/x.ktx2",
+            "terrain/X.KTX2",
+            "./terrain/x.ktx2",
+            "terrain/./x.ktx2",
+            "terrain//x.ktx2",
+            "terrain/x.ktx2/.",
+            "terrain/x.ktx2/",
+        ] {
+            let mut bad = table(3);
+            // Validate unused normal arrays too, not only entry-referenced diffuse arrays.
+            let mut normal = bad.arrays[0].clone();
+            normal.path = path.into();
+            normal.usage = LandTextureUsage::NormalLinear;
+            normal.format = LandTextureFormat::Bc5;
+            bad.arrays.push(normal);
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPath {
+                    array: 1,
+                    path: path.into(),
+                }),
+                "{path:?} must be refused without rewriting it"
+            );
+        }
+    }
+
+    /// An array path names exactly one nonempty file directly under `terrain/`.
+    #[test]
+    fn validate_requires_one_array_filename_under_terrain() {
+        for path in [
+            "terrain/.ktx2",
+            "terrain/subdir/x.ktx2",
+            "terrain/.. /x.ktx2",
+            "terrain/.../x.ktx2",
+        ] {
+            let mut bad = table(3);
+            bad.arrays[0].path = path.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPathOutsideTerrain {
+                    array: 0,
+                    path: path.into(),
+                }),
+                "{path:?} is not one array filename under terrain"
+            );
+        }
     }
 
     #[test]

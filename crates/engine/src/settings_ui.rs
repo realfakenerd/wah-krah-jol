@@ -843,7 +843,7 @@ pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "Left click",
-                "Capture cursor while playing; activate menu buttons",
+                "Capture cursor while playing; select a world reference in the console; activate menu buttons",
             ),
             ("Backtick", "Open / close developer console"),
             (

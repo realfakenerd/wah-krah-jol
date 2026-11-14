@@ -106,6 +106,9 @@ pub struct RenderingSettings {
 impl Default for RenderingSettings {
     fn default() -> Self {
         let config = EngineConfig::default();
+        let weather = crate::sky::WeatherLighting::default();
+        let sunlight = weather.sunlight.to_srgba();
+        let ambient = weather.mean_ambient().to_srgba();
         Self {
             version: 1,
             point_lights: false,
@@ -113,10 +116,10 @@ impl Default for RenderingSettings {
             point_light_shadows: false,
             point_shadow_size: 1,
             sun: true,
-            sun_illuminance: 12_000.0,
-            sun_color: [1.0; 3],
+            sun_illuminance: crate::lights::SUN_ILLUMINANCE,
+            sun_color: [sunlight.red, sunlight.green, sunlight.blue],
             ambient_brightness: crate::lights::AMBIENT_ILLUMINANCE,
-            ambient_color: [0.48, 0.55, 0.7],
+            ambient_color: [ambient.red, ambient.green, ambient.blue],
             shadows: true,
             shadow_size: 2,
             shadow_cascades: 4,
@@ -476,11 +479,13 @@ impl RenderingSettings {
         }
     }
 
+    /// Returns whether any shown value changed.
     pub(crate) fn show_resolved_grade(
         &mut self,
         grade: crate::color_pipeline::SkyrimCinematicGrade,
         pivot: f32,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         for (bit, slot, value) in [
             (0, &mut self.grade_saturation, grade.saturation),
             (1, &mut self.grade_brightness, grade.brightness),
@@ -491,10 +496,15 @@ impl RenderingSettings {
             (6, &mut self.grade_tint_blue, grade.tint_rgb[2]),
             (7, &mut self.grade_pivot, pivot),
         ] {
-            if self.grade_override_mask & (1 << bit) == 0 {
+            // Assign only on a real difference: this runs inside `apply_render_settings`,
+            // whose own `ResMut` change tick is what wakes the menu, the weather and the
+            // scene grade pipeline. Writing an equal value would wake them for nothing.
+            if self.grade_override_mask & (1 << bit) == 0 && *slot != value {
                 *slot = value;
+                changed = true;
             }
         }
+        changed
     }
 
     fn restore_grade_controls(&mut self, saved: &Self) {
@@ -862,20 +872,45 @@ pub(crate) struct RenderSettingsTargets<'w, 's> {
         With<StreamingCamera>,
     >,
     reflections: Query<'w, 's, Entity, With<crate::render::WaterReflectionCamera>>,
-    sun: Query<
+    /// The sun and the "a sun light appeared since the last apply" check need conflicting
+    /// access (`&mut DirectionalLight` against that component's change tick), so they share a
+    /// `ParamSet`. Every other target's marker is not mutated by this system, so those live in
+    /// `new_targets` as one query.
+    sun: ParamSet<
         'w,
         's,
         (
-            &'static mut DirectionalLight,
-            &'static mut CascadeShadowConfig,
+            Query<
+                'w,
+                's,
+                (
+                    &'static mut DirectionalLight,
+                    &'static mut CascadeShadowConfig,
+                ),
+            >,
+            Query<'w, 's, (), Added<DirectionalLight>>,
         ),
     >,
     ambient: Option<ResMut<'w, GlobalAmbientLight>>,
     shadow_map: Option<ResMut<'w, DirectionalLightShadowMap>>,
     point_shadow_map: Option<ResMut<'w, PointLightShadowMap>>,
     upload: Option<ResMut<'w, RenderAssetBytesPerFrame>>,
-    windows: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
+    windows: Query<'w, 's, (&'static mut Window, Ref<'static, PrimaryWindow>)>,
     hud: Query<'w, 's, &'static mut Node, With<crate::physics::NoclipOverlay>>,
+    /// Targets that appeared since the last apply. A camera, light, window or overlay
+    /// spawned after the last preference change still needs the current settings, so
+    /// `apply_render_settings` runs for it even though nothing else changed.
+    new_targets: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            Added<StreamingCamera>,
+            Added<crate::render::WaterReflectionCamera>,
+            Added<PrimaryWindow>,
+            Added<crate::physics::NoclipOverlay>,
+        )>,
+    >,
 }
 
 /// Apply only on preference changes. Weather, light budgets and water read the same resource.
@@ -888,13 +923,25 @@ pub(crate) fn apply_render_settings(
     mut tone_map_source: Option<ResMut<crate::tone_mapping::SceneToneMapSource>>,
     current_mode: Option<Res<crate::color_pipeline::SceneGradeMode>>,
     current_preset: Option<Res<crate::color_pipeline::SceneVisualPreset>>,
+    current_overrides: Option<Res<crate::color_pipeline::SceneGradeOverrides>>,
     mut sky_palette: Option<ResMut<crate::sky::SkyPalette>>,
     mut targets: RenderSettingsTargets,
     mut previous: Local<Option<RenderingSettings>>,
     adapter: Option<Res<RenderAdapter>>,
     mut file: Option<ResMut<SettingsFile>>,
 ) {
-    if !settings.is_changed() {
+    // This system writes some of its own inputs (the shown grade values, the MSAA fallback and
+    // the engine config), so the resource tick alone cannot mean "a preference changed": compare
+    // against the snapshot left by the previous run, and also run when the engine config or the
+    // renderer changed underneath it, or when a render target appeared since the last run.
+    // A settled frame returns here and does none of the work below.
+    let preferences_changed = settings.is_changed()
+        || previous.as_ref() != Some(&*settings)
+        || config.is_changed()
+        || adapter.as_ref().is_some_and(|adapter| adapter.is_changed())
+        || !targets.new_targets.is_empty()
+        || !targets.sun.p1().is_empty();
+    if !preferences_changed {
         return;
     }
     let old_mode = current_mode
@@ -915,7 +962,10 @@ pub(crate) fn apply_render_settings(
     let mut tone = tone_map_source.as_deref().cloned().unwrap_or_default();
     let selected_tonemapping = TONE_MAPS[settings.tone_map];
     tone.bevy_tonemapping = selected_tonemapping;
-    if let Some(source) = tone_map_source.as_deref_mut() {
+    let tone_map_changed = tone_map_source
+        .as_deref()
+        .is_some_and(|source| source.bevy_tonemapping != selected_tonemapping);
+    if tone_map_changed && let Some(source) = tone_map_source.as_deref_mut() {
         source.bevy_tonemapping = selected_tonemapping;
     }
     let overrides = settings.grade_overrides();
@@ -932,16 +982,31 @@ pub(crate) fn apply_render_settings(
             {
                 file.note_grade_mode_selection();
             }
-            settings.show_resolved_grade(resolved.grade, resolved.post.pivot);
-            if let Some(palette) = sky_palette.as_deref_mut() {
-                let next = source.sky_palette(preset);
-                if *palette != next {
-                    *palette = next;
-                }
+            // Through `ResMut` the call itself would mark the resource changed even when every
+            // value already matches, so the tick is set only for a real difference.
+            if settings
+                .bypass_change_detection()
+                .show_resolved_grade(resolved.grade, resolved.post.pivot)
+            {
+                settings.set_changed();
             }
-            commands.insert_resource(mode);
-            commands.insert_resource(preset);
-            commands.insert_resource(overrides);
+            let next_palette = source.sky_palette(preset);
+            let palette_changed = sky_palette.as_deref() != Some(&next_palette);
+            if palette_changed && let Some(palette) = sky_palette.as_deref_mut() {
+                *palette = next_palette;
+            }
+            // Re-inserting an equal value still bumps the change tick, and every reader of
+            // these resources (the scene grade pipeline, the menu) keys its work on that
+            // tick. Insert only what actually differs.
+            if current_mode.as_deref() != Some(&mode) {
+                commands.insert_resource(mode);
+            }
+            if current_preset.as_deref() != Some(&preset) {
+                commands.insert_resource(preset);
+            }
+            if current_overrides.as_deref() != Some(&overrides) {
+                commands.insert_resource(overrides);
+            }
         }
         Err(error) => {
             if let Some(previous) = previous.as_ref() {
@@ -957,7 +1022,8 @@ pub(crate) fn apply_render_settings(
         }
     }
     let samples = [1, 2, 4, 8][settings.msaa];
-    if let Some(adapter) = adapter
+    if settings.msaa != 0
+        && let Some(adapter) = adapter
         && [
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureFormat::Depth32Float,
@@ -993,7 +1059,7 @@ pub(crate) fn apply_render_settings(
         commands.entity(entity).insert(MSAA_MODES[settings.msaa]);
         apply_camera_features(&mut commands, entity, &settings);
     }
-    for (mut light, mut cascades) in &mut targets.sun {
+    for (mut light, mut cascades) in &mut targets.sun.p0() {
         light.illuminance = if settings.sun {
             settings.sun_illuminance
         } else {
@@ -1036,15 +1102,19 @@ pub(crate) fn apply_render_settings(
             max_bytes: config.max_upload_bytes_per_frame(),
         };
     }
-    for mut window in &mut targets.windows {
+    for (mut window, primary) in &mut targets.windows {
+        // A primary window that replaced the first one starts at its own defaults, so it
+        // takes the configured mode and size whether or not the preference changed.
+        let added = primary.is_added();
         window.present_mode = if settings.vsync {
             PresentMode::AutoVsync
         } else {
             PresentMode::AutoNoVsync
         };
-        if previous
-            .as_ref()
-            .is_none_or(|previous| previous.window_mode != settings.window_mode)
+        if added
+            || previous
+                .as_ref()
+                .is_none_or(|previous| previous.window_mode != settings.window_mode)
         {
             window.mode = if settings.window_mode == 0 {
                 WindowMode::Windowed
@@ -1052,9 +1122,10 @@ pub(crate) fn apply_render_settings(
                 WindowMode::BorderlessFullscreen(MonitorSelection::Current)
             };
         }
-        if previous
-            .as_ref()
-            .is_none_or(|previous| previous.window_size != settings.window_size)
+        if added
+            || previous
+                .as_ref()
+                .is_none_or(|previous| previous.window_size != settings.window_size)
         {
             let (width, height) = WINDOW_SIZES[settings.window_size];
             window.resolution.set(width as f32, height as f32);
@@ -1166,6 +1237,102 @@ mod tests {
     }
 
     #[test]
+    fn defaults_preserve_world_lighting_on_first_launch_and_reset() {
+        for minimal_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.json");
+            if minimal_file {
+                std::fs::write(&path, r#"{"version":1}"#).unwrap();
+            }
+            let mut config = EngineConfig::default();
+            let (settings, file) = prepare_settings_at(&mut config, Some(path.clone()));
+            let weather = crate::sky::WeatherLighting::default();
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .insert_resource(settings)
+                .insert_resource(file)
+                .insert_resource(GlobalAmbientLight {
+                    color: Color::srgb(0.2, 0.3, 0.4),
+                    brightness: 321.0,
+                    ..default()
+                })
+                .add_systems(Update, apply_render_settings);
+            let sun = app
+                .world_mut()
+                .spawn((
+                    DirectionalLight {
+                        color: Color::srgb(0.4, 0.3, 0.2),
+                        illuminance: 123.0,
+                        ..default()
+                    },
+                    crate::app::sun_shadow_cascades(&config),
+                ))
+                .id();
+            app.insert_resource(config);
+            let assert_lighting = |app: &App,
+                                   sun_color: Color,
+                                   sun_illuminance,
+                                   ambient_color: Color,
+                                   ambient_brightness| {
+                let light = app.world().get::<DirectionalLight>(sun).unwrap();
+                let ambient = app.world().resource::<GlobalAmbientLight>();
+                for (actual, expected) in [(light.color, sun_color), (ambient.color, ambient_color)]
+                {
+                    for (actual, expected) in actual
+                        .to_linear()
+                        .to_f32_array()
+                        .into_iter()
+                        .zip(expected.to_linear().to_f32_array())
+                    {
+                        assert!((actual - expected).abs() < 1e-6);
+                    }
+                }
+                assert_eq!(light.illuminance, sun_illuminance);
+                assert_eq!(ambient.brightness, ambient_brightness);
+            };
+            let assert_defaults = |app: &App| {
+                assert_lighting(
+                    app,
+                    weather.sunlight,
+                    crate::lights::SUN_ILLUMINANCE,
+                    weather.mean_ambient(),
+                    crate::lights::AMBIENT_ILLUMINANCE,
+                )
+            };
+            app.update();
+            assert_defaults(&app);
+
+            {
+                let mut settings = app.world_mut().resource_mut::<RenderingSettings>();
+                settings.sun_color = [1.0; 3];
+                settings.ambient_color = [0.1; 3];
+                settings.sun_illuminance = 4_000.0;
+                settings.ambient_brightness = 100.0;
+            }
+            app.update();
+            assert_lighting(
+                &app,
+                Color::srgb(1.0, 1.0, 1.0),
+                4_000.0,
+                Color::srgb(0.1, 0.1, 0.1),
+                100.0,
+            );
+            app.world_mut()
+                .resource_scope(|world, mut file: Mut<SettingsFile>| {
+                    file.restore_defaults(&mut world.resource_mut::<RenderingSettings>());
+                });
+            app.update();
+            assert_defaults(&app);
+            save_app_settings(&mut app);
+            let mut config = EngineConfig::default();
+            let (reloaded, _) = prepare_settings_at(&mut config, Some(path));
+            *app.world_mut().resource_mut::<RenderingSettings>() = reloaded;
+            app.update();
+            assert_defaults(&app);
+        }
+    }
+
+    #[test]
     fn menu_numeric_adjustment_reaches_scene_camera_as_explicit_override() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
@@ -1232,6 +1399,116 @@ mod tests {
                 .unwrap()
                 .brightness,
             after
+        );
+    }
+
+    /// What `apply_render_settings` did on the frame that just ran, seen by a system that
+    /// runs after it on the same frame.
+    #[derive(Resource, Default)]
+    struct SettingsApplyProbe {
+        settings_changed: bool,
+        grade_mode_changed: bool,
+    }
+
+    /// Records, after the apply, whether the settings and the scene grade mode changed.
+    fn probe_settings_apply(
+        settings: Res<RenderingSettings>,
+        mode: Option<Res<crate::color_pipeline::SceneGradeMode>>,
+        mut probe: ResMut<SettingsApplyProbe>,
+    ) {
+        probe.settings_changed = settings.is_changed();
+        probe.grade_mode_changed = mode.is_some_and(|mode| mode.is_changed());
+    }
+
+    /// With nothing changed, the apply leaves the settings and the scene grade untouched.
+    #[test]
+    fn settled_render_settings_are_not_reapplied_every_frame() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderingSettings::default())
+            .insert_resource(SettingsFile::session_only())
+            .insert_resource(crate::color_pipeline::SceneGradeMode::SnapshotSrgb)
+            .insert_resource(crate::color_pipeline::SceneVisualPreset::CoolGray)
+            .insert_resource(crate::color_pipeline::SceneGradeSource::default())
+            .insert_resource(crate::tone_mapping::SceneToneMapSource::default())
+            .insert_resource(crate::sky::SkyPalette::default())
+            .init_resource::<SettingsApplyProbe>()
+            .add_systems(Update, apply_render_settings)
+            .add_systems(Last, probe_settings_apply);
+        app.update();
+        // The launch frame legitimately applies the settings the run started with. Every
+        // later frame with no menu action, no config change and no new target is settled:
+        // it must not dirty `RenderingSettings` nor replace an identical scene grade.
+        for frame in 1..=3 {
+            app.update();
+            let probe = app.world().resource::<SettingsApplyProbe>();
+            assert!(
+                !probe.settings_changed,
+                "frame {frame}: apply_render_settings dirtied RenderingSettings with nothing changed"
+            );
+            assert!(
+                !probe.grade_mode_changed,
+                "frame {frame}: apply_render_settings replaced an identical SceneGradeMode"
+            );
+        }
+        // A preference change that does not touch the grade (here the HUD toggle) still runs
+        // the apply, but must not replace the identical scene grade resources: every reader
+        // of `SceneGradeMode` keys its work on that change tick.
+        app.world_mut().resource_mut::<RenderingSettings>().hud = !RenderingSettings::default().hud;
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<SettingsApplyProbe>()
+                .grade_mode_changed,
+            "an unchanged scene grade was replaced after an unrelated preference change"
+        );
+    }
+
+    /// A render target that appears later runs the apply again. That run must not dirty
+    /// `RenderingSettings` when the shown grade is already current, and a replacement
+    /// primary window must take the configured mode and size, which its defaults differ from.
+    #[test]
+    fn a_new_target_reapplies_without_dirtying_settings_and_sizes_a_new_window() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderingSettings {
+                window_mode: 1,
+                window_size: 3,
+                ..RenderingSettings::default()
+            })
+            .insert_resource(SettingsFile::session_only())
+            .insert_resource(crate::color_pipeline::SceneGradeMode::SnapshotSrgb)
+            .insert_resource(crate::color_pipeline::SceneVisualPreset::CoolGray)
+            .insert_resource(crate::color_pipeline::SceneGradeSource::default())
+            .insert_resource(crate::tone_mapping::SceneToneMapSource::default())
+            .insert_resource(crate::sky::SkyPalette::default())
+            .init_resource::<SettingsApplyProbe>()
+            .add_systems(Update, apply_render_settings)
+            .add_systems(Last, probe_settings_apply);
+        app.update();
+        app.update();
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<SettingsApplyProbe>()
+                .settings_changed,
+            "a new target dirtied RenderingSettings although no shown value changed"
+        );
+        let window = app.world().get::<Window>(window).unwrap();
+        assert_eq!(
+            window.mode,
+            WindowMode::BorderlessFullscreen(MonitorSelection::Current)
+        );
+        let (width, height) = WINDOW_SIZES[3];
+        assert_eq!(
+            (window.resolution.width(), window.resolution.height()),
+            (width as f32, height as f32)
         );
     }
 

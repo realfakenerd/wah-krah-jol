@@ -1,7 +1,5 @@
 # Writing PRs, issues and review comments
 
-> **Proposal** (#79): agreed by a contributor, waiting for a maintainer's confirmation. Follow it for now and comment on the issue if you disagree.
-
 A short guide for anyone sending work here, written by hand or with an AI assistant. It goes with the PR template (`.github/PULL_REQUEST_TEMPLATE.md`); the steps around it (claiming work, drafts, review, merging) are in [workflow.md](workflow.md). The aim is text a reviewer can read in two minutes and a newcomer can follow without already knowing the answer.
 
 ## The three rules that matter most
@@ -19,7 +17,34 @@ A short guide for anyone sending work here, written by hand or with an AI assist
 
 ## PR titles
 
-`type(scope): plain effect`, at most 72 characters, lower case after the colon. With a squash merge the title becomes the commit message on main, so leave out PR numbers and notes like "part 2". Types: `fix`, `feat`, `perf`, `refactor`, `test`, `docs`, `chore`. Scope is the crate or area: `converter` and `dummy-content` (label `area: converter`), `engine` (`area: engine`), `launcher` (`area: launcher`), `shared` (`area: shared`), `scripts` and `ci` (`area: ci`).
+PR titles must strictly adhere to the [Conventional Commits](https://www.conventionalcommits.org/) specification (`type(scope): description` or `type(scope)!: description`).
+
+With a squash merge, the PR title becomes the exact commit message on `main` (the repository's squash-merge setting uses the PR title as the commit title). These titles drive changelog generation via `git-cliff` and tell maintainers which SemVer bump a release needs. See [releasing.md](releasing.md). Non-conventional titles are blocked in CI.
+
+- **Format:** `type(scope): plain effect`, at most 72 characters, lowercase after the colon unless the description starts with a listed acronym (for example `fix(engine): NIF parser panic`). Leave out PR numbers and notes like "part 2".
+- **Types:**
+  - `feat`: New capability, record parser, or feature (maps to *Added*).
+  - `fix`: Bug, panic, or visual defect correction (maps to *Fixed*).
+  - `perf`: Performance or memory allocation optimization (maps to *Performance*).
+  - `refactor`: Structural code cleanup without behavior change (maps to *Changed*).
+  - `style`: Formatting, whitespace, or cosmetic code changes without logic changes (maps to *Changed*).
+  - `revert`: Reverting a previous commit (maps to *Removed*).
+  - `build`: Changes to build system, toolchains, or external dependencies (maps to *Tooling & CI*).
+  - `docs`: Documentation, guides, or specifications (maps to *Documentation*).
+  - `test`: Adding or correcting tests or fixtures (maps to *Tests*).
+  - `chore`: Auxiliary tooling, dependencies, or maintenance tasks (maps to *Tooling & CI*).
+  - `ci`: CI workflows, GitHub Actions, and release pipelines (maps to *Tooling & CI*).
+- **Scopes:** the allowed scopes (crates such as `converter` and `engine`, and areas such as `ci`, `scripts` and `release`) and the allowed leading acronyms (`NIF`, `LOD`, `BSA`, `MO2` and so on) are listed in `.github/workflows/pr_title.yml`. That file is what CI enforces, so add a scope or acronym there when a new crate or term needs one. A scope is optional when a change crosses several subsystems or applies broadly.
+- **Breaking changes (`!`):**
+  - Append an exclamation point before the colon for breaking changes: `type(scope)!: description` (e.g., `feat(converter)!: advance world database schema to 10`).
+  - In the PR body footer, include `BREAKING CHANGE: <explanation>` detailing migration impact (such as mandatory asset reconversion).
+
+## Release branches
+
+- **`main`**: Target branch for ongoing development and roadmap features.
+- **`release/vX.Y.x`** (e.g. `release/v0.1.x`): Maintained for post-release hotfixes and critical patch releases without blocking feature work on `main`.
+- Target `main` by default. Only target a release branch when explicitly backporting an approved patch.
+- How to tag, publish and hotfix: [releasing.md](releasing.md).
 
 ## PR body
 

@@ -428,7 +428,10 @@ fn console_input_system(
     }
     // A report hides UI without yielding gameplay input. Preserve the user's pending backtick
     // restoration until readback ends; Escape still leaves it released permanently.
-    if !state.capture_suppressed
+    // `is_some()` reads through `Deref`, so a frame with no pending restore does not dirty
+    // `ConsoleState`; only the frame that actually restores capture mutates it.
+    if state.restore_capture.is_some()
+        && !state.capture_suppressed
         && let Some(restored) = state.restore_capture.take()
     {
         *capture = restored;
@@ -518,7 +521,7 @@ fn console_dispatch_system(world: &mut World) {
 }
 
 #[derive(Component)]
-struct ConsoleRoot;
+pub(crate) struct ConsoleRoot;
 #[derive(Component)]
 struct ConsoleScrollText;
 #[derive(Component)]
@@ -545,6 +548,12 @@ fn spawn_console_ui(mut commands: Commands) {
             GlobalZIndex(1000),
         ))
         .with_children(|root| {
+            root.spawn((
+                crate::console_selection::ConsoleSelectionText,
+                Text::new(crate::console_selection::SELECTION_HINT),
+                TextFont::from_font_size(16.0),
+                TextColor(Color::srgb(1.0, 0.9, 0.2)),
+            ));
             root.spawn((
                 ConsoleScrollText,
                 Text::new(""),
@@ -652,6 +661,33 @@ mod tests {
 
     fn scrollback(app: &App) -> String {
         app.world().resource::<ConsoleState>().scrollback.join("\n")
+    }
+
+    /// Whether a system running at the end of the frame saw `ConsoleState` changed.
+    #[derive(Resource, Default)]
+    struct ConsoleStateProbe(Option<bool>);
+
+    /// Records, at the end of the frame, whether `ConsoleState` was marked changed.
+    fn probe_console_state(state: Res<ConsoleState>, mut probe: ResMut<ConsoleStateProbe>) {
+        probe.0 = Some(state.is_changed());
+    }
+
+    /// A closed console with no input leaves `ConsoleState` untouched frame after frame.
+    #[test]
+    fn settled_closed_console_does_not_dirty_its_state() {
+        let mut app = console_app();
+        app.init_resource::<ConsoleStateProbe>()
+            .add_systems(Last, probe_console_state);
+        // The probe's own first run sets its change-detection baseline.
+        app.update();
+        for frame in 1..=3 {
+            app.update();
+            assert_eq!(
+                app.world().resource::<ConsoleStateProbe>().0,
+                Some(false),
+                "frame {frame}: a settled closed console marked ConsoleState changed"
+            );
+        }
     }
 
     /// Records which command ran, in registration order.

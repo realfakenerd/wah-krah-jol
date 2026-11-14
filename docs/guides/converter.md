@@ -80,6 +80,11 @@ The CPU timings were measured before the CPU path wrote native BC for uncompress
 
 On the author's 20 sample textures, quality was about 0.3–0.5 dB PSNR below the CPU encoder's UASTC level 2, both after BC7 transcoding (desktop) and as ASTC (mobile). The comparison tool is not part of this repository, so treat these figures as indicative.
 
+Those samples do not demonstrate mobile/browser pack loading. Native BC still bypasses GPU
+encoding, and CPU fallback can emit BC7. See the [desktop texture contract and proposed
+portable-output deferral](../adr/0014-phase1-desktop-texture-contract.md), pending approval in
+[#274](https://github.com/Mudcrab-Team/mudcrab/issues/274).
+
 - `--gpu-quality N` — endpoint refinement passes, 0–8 (default 2).
 - `--gpu-batch-mb N` — source megabytes packed into one GPU dispatch (default 256).
 

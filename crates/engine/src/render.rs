@@ -497,8 +497,8 @@ impl TerrainExtension {
         .map(Handle::id)
     }
 
-    /// Builds the material without looking up zero texture IDs, retaining those layers' slots
-    /// and weights. Nonzero texture IDs still require a converted diffuse image.
+    /// Retains slots and weights for zero IDs and unresolved diffuse images without binding
+    /// either a diffuse or a normal image for those layers.
     pub fn from_quadrant(
         terrain: &TerrainSnapshot,
         quadrant: u8,
@@ -515,6 +515,10 @@ impl TerrainExtension {
                 // A preserved unresolved layer keeps its slot and weights with no image bound.
                 continue;
             }
+            let Some(path) = catalog.landscape_diffuse(layer.texture_form_id) else {
+                // Keep the unresolved layer's weight without loading an orphan normal map.
+                continue;
+            };
             if let Some(path) = catalog.landscape_normal(layer.texture_form_id) {
                 // A normal map holds directions, not colours: it must not be decoded as sRGB.
                 let handle = asset_server
@@ -527,14 +531,6 @@ impl TerrainExtension {
                 *normal = Some(handle.clone());
                 normal_handles.push(handle);
             }
-            let path = catalog
-                .landscape_diffuse(layer.texture_form_id)
-                .ok_or_else(|| {
-                    format!(
-                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
-                        terrain.cell_id, layer.texture_form_id
-                    )
-                })?;
             let handle = asset_server
                 .load_builder()
                 .with_settings(|settings: &mut ImageLoaderSettings| {
@@ -2048,8 +2044,8 @@ mod tests {
         );
     }
 
-    /// Zero overlays keep material slots and weights without image requests; a nonzero LTEX
-    /// with no diffuse image still fails without preventing a subsequent placeholder build.
+    /// Zero and unresolved nonzero overlays keep material slots and weights without requesting
+    /// a diffuse image or an orphan normal map.
     #[test]
     fn terrain_zero_texture_overlay_material_preserves_slots_without_image_requests() {
         let directory = tempfile::tempdir().unwrap();
@@ -2057,11 +2053,12 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
-                 INSERT INTO texture_sets VALUES(1,'textures/zero-must-not-load.dds');
-                 INSERT INTO landscape_textures VALUES(0,1),(2116,NULL);",
+                 INSERT INTO texture_sets VALUES(1,'textures/zero-must-not-load.dds',NULL);
+                 INSERT INTO texture_sets VALUES(2,NULL,'textures/orphan-normal-must-not-load.dds');
+                 INSERT INTO landscape_textures VALUES(0,1),(2116,2);",
             )
             .unwrap();
         drop(connection);
@@ -2108,10 +2105,16 @@ mod tests {
         assert_eq!(sample(1, 0), 0.0);
 
         terrain.layers[2].texture_form_id = 0x844;
-        let error = TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server)
-            .err()
-            .expect("a nonzero LTEX without a diffuse image still fails");
-        assert!(error.contains("00000844") && error.contains("no diffuse image"));
+        assert!(catalog.landscape_normal(0x844).is_some());
+        let (fallback, images) =
+            TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server)
+                .expect("a missing diffuse retains the layer without requesting either image");
+        assert!(images.color.is_empty() && images.normal.is_empty());
+        assert!(fallback.layer_2.is_none() && fallback.normal_2.is_none());
+        assert_eq!(fallback.settings.weights, extension.settings.weights);
+        assert_eq!(fallback.settings.tiling_and_layer_count.z, 3.0);
+        assert_eq!(fallback.settings.normal_layers_0, Vec4::ZERO);
+        assert_eq!(fallback.settings.normal_layers_1, Vec4::ZERO);
         terrain.layers[2].texture_form_id = 0;
         assert!(TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server).is_ok());
     }

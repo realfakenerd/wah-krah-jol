@@ -226,6 +226,64 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
     }
 }
 
+/// Unusable texture set paths clear only their own runtime columns; the valid slot and the
+/// archived record stay, and conversion still publishes for both record readers.
+#[tokio::test]
+async fn unsafe_texture_set_paths_clear_their_slots_and_still_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    generate(&data);
+    let form_id = 0x1800;
+    let valid_normal = "textures/txst_kept_n.dds";
+    let traversal = b"..\\..\\outside.dds\0".to_vec();
+    append(
+        &data.join("Skyrim.esm"),
+        &record(
+            b"TXST",
+            form_id,
+            &[
+                (*b"EDID", b"UnsafeSlots\0".to_vec()),
+                (*b"TX00", traversal.clone()),
+                (*b"TX01", [valid_normal.as_bytes(), &[0]].concat()),
+                (*b"TX02", b"/textures/rooted.dds\0".to_vec()),
+                (*b"TX03", b"C:\\textures\\drive.dds\0".to_vec()),
+                (*b"TX04", b"textures/not_a_texture.png\0".to_vec()),
+            ],
+        ),
+    );
+
+    for reader in [RecordReader::Legacy, RecordReader::Inhouse] {
+        let output = temp.path().join(format!("pack-{reader:?}"));
+        let report = publish_with_reader(&data, &output, reader).await;
+        let integration = report.integration.as_ref().unwrap();
+        assert!(integration.passed, "{reader:?}: {integration:?}");
+        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let slots: [Option<String>; 5] = database
+            .query_row(
+                "SELECT diffuse_path,normal_path,mask_path,glow_path,height_path \
+                 FROM texture_sets WHERE id=?1",
+                [form_id],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ])
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            slots,
+            [None, Some(valid_normal.to_owned()), None, None, None],
+            "{reader:?}"
+        );
+        let archived = canonical_fields(&output, form_id);
+        assert!(archived.contains(&(*b"TX00", traversal.clone())));
+    }
+}
+
 /// Selected union banks survive real publication, while one malformed leaf stays local.
 #[tokio::test]
 async fn localized_union_definitions_publish_selected_banks_and_valid_neighbors() {

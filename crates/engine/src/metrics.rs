@@ -836,7 +836,12 @@ fn collect_and_finish(
             passed,
             "acceptance benchmark complete"
         ),
-        Err(error) => error!(%error, "failed to write benchmark report"),
+        Err(error) => {
+            error!(%error, "failed to write benchmark report");
+            exit.write(AppExit::error());
+            samples.finished = true;
+            return;
+        }
     }
     samples.finished = true;
     exit.write(if passed {
@@ -1945,5 +1950,40 @@ mod tests {
         let report = written_report(directory.path());
         assert_eq!(report["thresholds"]["screenshot_captured"], true);
         assert_eq!(report["passed"], true);
+    }
+
+    /// A report that cannot be written fails the run even when every measured threshold passed.
+    /// Otherwise a full disk, a read-only directory or a path that is a directory exits as a pass
+    /// with no report for acceptance to read.
+    #[test]
+    fn an_unwritable_report_fails_the_run() {
+        use bevy::app::AppExit;
+        use bevy::ecs::message::Messages;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = acceptance_report_app(directory.path(), None, std::time::Duration::ZERO);
+        // The report path is the temp directory itself: `create_dir_all` on its parent succeeds
+        // and `fs::write` on the directory always fails, as it does on a disk that cannot take
+        // the file.
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .benchmark_output = directory.path().to_path_buf();
+        app.update();
+        assert!(app.world().resource::<BenchmarkSamples>().finished);
+        let exits: Vec<AppExit> = app
+            .world()
+            .resource::<Messages<AppExit>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect();
+        assert_eq!(
+            exits,
+            vec![AppExit::error()],
+            "a report that was not written fails the run"
+        );
+        assert!(
+            fs::read_dir(directory.path()).unwrap().next().is_none(),
+            "the failed run left a report behind"
+        );
     }
 }

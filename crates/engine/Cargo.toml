@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+collision-measure = []
+
 [dependencies]
 shared = { path = "../shared" }
-bevy.workspace = true
+bevy = { workspace = true, features = ["mesh_picking"] }
 gltf = { version = "1.4", default-features = false }
 wgpu = { version = "=29.0.4", default-features = false }
 bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3", "debug-render-3d"] }

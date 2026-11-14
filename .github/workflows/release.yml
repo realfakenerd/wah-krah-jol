@@ -1,0 +1,326 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+      draft:
+        description: 'Publish as Draft release'
+        type: boolean
+        default: true
+      skip_ci_gate:
+        description: 'Skip the "tests_pass succeeded on this commit" check (forks and dry runs only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RUSTUP_TOOLCHAIN: "1.98.1"
+
+jobs:
+  preflight:
+    name: Preflight & Metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      tag: ${{ steps.resolve_tag.outputs.tag }}
+      is_draft: ${{ steps.resolve_tag.outputs.is_draft }}
+      is_prerelease: ${{ steps.resolve_tag.outputs.is_prerelease }}
+      commit: ${{ steps.resolve_tag.outputs.commit }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+
+      - name: Resolve and validate release tag
+        id: resolve_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_DRAFT: ${{ github.event.inputs.draft }}
+          INPUT_SKIP_CI_GATE: ${{ github.event.inputs.skip_ci_gate }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+
+          # Validate before anything is written to $GITHUB_OUTPUT: a multi-line
+          # dispatch input must not be able to inject extra outputs.
+          SEMVER_REGEX='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z.-]+))?(\+([0-9A-Za-z.-]+))?$'
+          if [[ ! "$TAG" =~ $SEMVER_REGEX ]]; then
+            echo "::error::Release tag is not SemVer 2.0 (e.g. v0.1.0)!"
+            exit 1
+          fi
+
+          # Tag pushes always create a draft; promote it from the Releases page.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_DRAFT" = "false" ]; then
+            IS_DRAFT=false
+          else
+            IS_DRAFT=true
+          fi
+
+          if [[ "${TAG%%+*}" == *-* ]]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
+          # The tag must exist; every job builds this exact commit.
+          COMMIT="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+
+          # Verify tag commit is reachable from origin/main or origin/release/*
+          git fetch origin main 'release/*:refs/remotes/origin/release/*'
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            if ! git branch -r --contains "$COMMIT" | grep -q 'origin/release/'; then
+              echo "::error::Release commit $COMMIT is not reachable from origin/main or origin/release/*!"
+              exit 1
+            fi
+          fi
+
+          # The commit must have passed the full test pipeline (latest tests_pass run wins).
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_SKIP_CI_GATE" = "true" ]; then
+            echo "::warning::Skipping the tests_pass gate for $COMMIT (skip_ci_gate=true)."
+          else
+            CI_RESULT="$(gh api "repos/${REPO}/commits/${COMMIT}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "tests_pass")] | sort_by(.started_at) | last | .conclusion // "missing"')"
+            if [ "$CI_RESULT" != "success" ]; then
+              echo "::error::tests_pass is '${CI_RESULT}' for $COMMIT; refusing to release a commit that did not pass CI."
+              exit 1
+            fi
+          fi
+
+          git checkout --detach "$COMMIT"
+
+          CARGO_VERSION="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "shared").version')"
+          TAG_VERSION="${TAG#v}"
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Tag '$TAG' does not match Cargo.toml workspace version '$CARGO_VERSION'!"
+            exit 1
+          fi
+          echo "Tag $TAG matches workspace version $CARGO_VERSION at $COMMIT."
+
+          {
+            echo "tag=${TAG}"
+            echo "is_draft=${IS_DRAFT}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "commit=${COMMIT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@2c5a065444fe3f40756405ba5abfcf6a873b33ab
+        with:
+          tool: git-cliff
+
+      - name: Generate Changelog with git-cliff
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve_tag.outputs.tag }}
+        run: |
+          git-cliff --current --tag "$TAG" --strip all --output RELEASE_NOTES.md
+
+      - name: Generate release-metadata.json
+        env:
+          RELEASE_TAG: ${{ steps.resolve_tag.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.resolve_tag.outputs.commit }}
+        run: |
+          cargo run --locked -p shared --bin release_metadata > release-metadata.json
+
+      - name: Upload preflight artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: preflight-metadata
+          path: |
+            RELEASE_NOTES.md
+            release-metadata.json
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [preflight]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: "tar.gz"
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: "zip"
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive_ext: "tar.gz"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_ext: "tar.gz"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+
+      - name: Set up mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} \
+            -p launcher -p engine -p converter \
+            --bin launcher --bin engine --bin converter --bin world-inspect
+
+      - name: Stage distribution payload
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          bash scripts/stage-release.sh --target "$TARGET"
+
+      - name: Package binaries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.archive_ext }}
+        run: |
+          ARCHIVE="mudcrab-${TAG}-${TARGET}.${EXT}"
+          cd "target/${TARGET}/staging"
+          tar -czf "../../../${ARCHIVE}" *
+          cd ../../..
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.archive_ext }}
+        run: |
+          ARCHIVE="mudcrab-${TAG}-${TARGET}.${EXT}"
+          cd "target/${TARGET}/staging"
+          7z a "../../../${ARCHIVE}" *
+          cd ../../..
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Build Windows Setup Wizard (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          CLEAN_VERSION="${TAG#v}"
+          ISCC_PATH="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -x "$ISCC_PATH" ]; then
+            choco install innosetup --no-progress -y
+          fi
+          "$ISCC_PATH" \
+            "/DAppVersion=${CLEAN_VERSION}" \
+            "/DStagingDir=$(cygpath -w "$(pwd)/target/${TARGET}/staging")" \
+            "/DOutputDir=$(cygpath -w "$(pwd)")" \
+            installer/windows/mudcrab.iss
+          SETUP_EXE="mudcrab-${TAG}-windows-x64-setup.exe"
+          sha256sum "${SETUP_EXE}" > "${SETUP_EXE}.sha256"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            mudcrab-*.${{ matrix.archive_ext }}
+            mudcrab-*.exe
+            mudcrab-*.sha256
+
+  publish:
+    name: Publish Release
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download preflight artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: preflight-metadata
+          path: ./dist
+
+      - name: Download all bundle artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ./artifacts
+
+      - name: Consolidate distribution assets
+        run: |
+          mkdir -p ./dist
+          find ./artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.exe" \) -exec cp {} ./dist/ \;
+          find ./artifacts -type f -name "*.sha256" -exec cat {} + | sort -u > ./dist/SHA256SUMS.txt
+
+          echo "Prepared release assets:"
+          ls -la ./dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: Mudcrab ${{ needs.preflight.outputs.tag }}
+          body_path: ./dist/RELEASE_NOTES.md
+          draft: ${{ needs.preflight.outputs.is_draft == 'true' }}
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+          files: |
+            ./dist/*.tar.gz
+            ./dist/*.zip
+            ./dist/*.exe
+            ./dist/SHA256SUMS.txt
+            ./dist/release-metadata.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

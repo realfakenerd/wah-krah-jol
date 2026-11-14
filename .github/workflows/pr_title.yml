@@ -1,0 +1,34 @@
+name: pr_title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  # Lets this job be a required check in the merge queue. The title was already
+  # validated on the PR, so the queue run has nothing left to check.
+  merge_group:
+
+permissions:
+  pull-requests: read
+
+jobs:
+  pr_title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Conventional Commit PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # This file is the source of truth for types, scopes and acronyms;
+          # docs/contributing/writing-prs.md describes the rule and links here.
+          TYPES='feat|fix|perf|refactor|style|revert|build|docs|test|chore|ci'
+          SCOPES='converter|engine|launcher|shared|mo2|dummy-content|ci|scripts|release|deps|nif|converters|streaming|lod-experiment'
+          # Domain terms that may start the description in capitals.
+          ACRONYMS='NIF|LOD|BSA|ESM|ESP|ESL|DDS|MO2|TES4|TES5|NPC|GPU|CPU|PBR|BC1|BC7|HDR|UV|UI|API|CLI|JSON|PNG|SQL'
+          # Type, optional scope, optional '!' for breaking changes, then a lowercase
+          # start or a listed acronym (followed by a non-alphanumeric or the end).
+          REGEX="^(${TYPES})(\((${SCOPES})\))?!?: ([a-z]|(${ACRONYMS})([^A-Za-z0-9]|$))"
+          if [[ ! "$PR_TITLE" =~ $REGEX ]] || [ "${#PR_TITLE}" -gt 72 ]; then
+            echo "::error::PR title '$PR_TITLE' must be 'type(scope): description' (lowercase after the colon unless it starts with a listed acronym, max 72 chars). See docs/contributing/writing-prs.md."
+            exit 1
+          fi

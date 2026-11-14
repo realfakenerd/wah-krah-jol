@@ -666,6 +666,10 @@ impl EngineConfig {
     /// limit: the jump moves only the camera, and in WALK the camera follow would put it straight
     /// back at the player's body.
     pub fn interactive_world_physics(&self) -> bool {
+        #[cfg(feature = "collision-measure")]
+        if std::env::var_os("MUDCRAB_COLLISION_MEASURE").is_some() {
+            return true;
+        }
         !self.headless
             && !self.hidden_window
             && self.benchmark_jump.is_none()
@@ -1672,6 +1676,15 @@ mod tests {
     /// This file, so the tests can read the parser's own match arms back out of
     /// it instead of keeping a second list of option names in step by hand.
     const CONFIG_SOURCE: &str = include_str!("config.rs");
+
+    /// Flags owned by one release script: (file name, flag). Scoped like the
+    /// observation tool's `--verify`, so any other script passing one of them
+    /// to the engine still fails the audit.
+    const SCRIPT_SCOPED_FLAGS: &[(&str, &str)] = &[
+        ("install.sh", "--progress-bar"), // curl
+        ("stage-release.sh", "--dest"),
+        ("stage-release.sh", "--target"),
+    ];
 
     /// Flags consumed by Cargo, Git, `world-inspect`, the dynamic loader,
     /// audit tools and launch wrappers. Wrappers also contain engine invocations,
@@ -3606,7 +3619,16 @@ mod tests {
                     "--video-format",
                 ]
                 .contains(&flag);
-            if NON_ENGINE_FLAGS.contains(&flag) || observation_option || inspector_option {
+            let release_option = path.file_name().is_some_and(|name| {
+                SCRIPT_SCOPED_FLAGS
+                    .iter()
+                    .any(|&(script, scoped)| name == script && flag == scoped)
+            });
+            if NON_ENGINE_FLAGS.contains(&flag)
+                || observation_option
+                || release_option
+                || inspector_option
+            {
                 continue;
             }
             assert!(
@@ -3648,6 +3670,21 @@ mod tests {
             })
             .is_err()
         );
+        for (script, flag) in SCRIPT_SCOPED_FLAGS {
+            let line = format!("{flag} value");
+            assert_eq!(
+                checked_script_engine_flags(&line, std::path::Path::new(script)),
+                0,
+                "{flag} must be exempt in {script}"
+            );
+            assert!(
+                std::panic::catch_unwind(|| {
+                    checked_script_engine_flags(&line, std::path::Path::new("launch.sh"))
+                })
+                .is_err(),
+                "{flag} must still be rejected in other scripts"
+            );
+        }
     }
 
     /// Standalone inspector flags must not become general engine CLI options.

@@ -1,15 +1,20 @@
 # DDS to KTX2 Texture Conversion
 
-Mudcrab converts extracted Skyrim DDS assets ahead of time to KTX2 containers. Two output
-profiles exist:
+Mudcrab converts extracted Skyrim DDS assets ahead of time to KTX2 containers. The current
+desktop policy has three routes, not selectable desktop and portable profiles:
 
-| Output profile | Texture policy |
+| Output route | Texture policy |
 | --- | --- |
-| **Desktop/native** (default) | Preserve compatible DDS block formats inside KTX2; transcode only when required. |
-| **Portable fallback** | UASTC for sources with no native mapping, with matching supercompression. |
+| **Native preservation** | Copy compatible DDS mip payloads inside KTX2. |
+| **CPU BC7 encoding** | Encode eligible packed 2D RGB(A) sources to native BC7. |
+| **UASTC fallback** | Encode other decodable sources to UASTC; the GPU also uses UASTC for admitted inputs. |
 
-The desktop profile keeps BC1-BC7, R8, and RGBA8 payloads byte-for-byte: no re-encoding loss,
-no 2x BC1/BC4 growth, and the runtime samples the original GPU format directly.
+Compatible BC1/BC2/BC3/BC7 and DXGI RGBA8 payloads copy byte-for-byte; BC4/BC5/BC6H and
+DXGI R8 do so only in linear slots. Native preservation adds no re-encoding loss, and the runtime
+samples that GPU format directly. UASTC fallback is not a whole-pack portable profile.
+[ADR-0014](../../adr/0014-phase1-desktop-texture-contract.md) proposes the Phase 1 desktop
+scope; deferral approval and portable-profile work remain open in
+[#274](https://github.com/Mudcrab-Team/mudcrab/issues/274).
 
 ## Semantic encoding contract
 
@@ -22,15 +27,15 @@ Color space is derived from the consuming slot, never from a filename suffix or 
 | metallic/roughness, occlusion, height, masks, inner layer, greyscale | linear data |
 
 The converter collects semantics from every published GLB plus `texture_sets` and water rows in the
-world database. A texture reached through incompatible classes is rejected because one KTX2 URI
-cannot safely represent both transfer functions. Unclassified assets remain linear/data rather than
-being guessed from their names.
+world database. Shared uses resolve by precedence: normal, data, color/emissive, then
+unclassified linear/data. The converter does not reject every conflicting use or guess from names.
 
 ## Supported DDS topology and formats
 
 - BC1, BC2, BC3, BC4, BC5, BC6H and BC7 2D textures are covered by conversion fixtures.
 - Six-face cubemaps and reachable 3D volume textures preserve their topology.
-- Ordinary texture arrays are rejected explicitly.
+- Ordinary texture arrays and cube arrays are rejected explicitly. Generated merged-terrain
+  arrays have a separate BC output contract; see [ADR-0014](../../adr/0014-phase1-desktop-texture-contract.md).
 - All authored DDS mip levels are preserved independently; the converter does not replace
   them with a generated chain. A representation that would lose source levels is a hard failure.
 - RGBA alpha is retained for opaque, cutout and blended material consumers.
@@ -39,9 +44,10 @@ being guessed from their names.
 
 Preservable sources (FourCC DXT1-DXT5 plus DXGI BC1-BC7, R8, RGBA8, 2D/cubemap/volume) map to
 their native `VkFormat` with sRGB vs linear taken from slot semantics, never the filename. Each
-mip level's bytes copy verbatim; cubemap levels gather one slice per face, volume levels keep
-their depth slices. The DFD is generated from the target format. Unmapped DXGI formats and L8 fall
-back to the UASTC path.
+mip level's bytes copy verbatim where that format has a mapping for the slot's transfer function;
+cubemap levels gather one slice per face, volume levels keep their depth slices. The DFD is
+generated from the target format. Unmapped formats proceed through CPU BC7 eligibility and
+then UASTC fallback; BC4/BC5/BC6H and R8 have no native sRGB mapping.
 
 Uncompressed 2D textures with whole-byte channels (24-bit B8G8R8, X8R8G8B8, A8R8G8B8, A8B8G8R8
 and other RGB(A) bitmask layouts, DXGI B8G8R8A8/B8G8R8X8) are not re-encoded with UASTC, which
@@ -52,7 +58,9 @@ two below it). sRGB vs UNORM comes from the slot encoding. BC7 is what the runti
 transcoded the former UASTC output to on desktop, so GPU memory does not change. Like the
 preserved BC sources, this output belongs to the desktop profile: GPUs without BC support (Adreno
 on Android) cannot sample it, and a portable profile would have to encode these textures and the
-preserved BC sources to UASTC instead. No converter option selects that profile yet.
+preserved BC sources to a portable representation. No converter option selects that profile yet;
+the proposed scope and pending decision are recorded in [ADR-0014](../../adr/0014-phase1-desktop-texture-contract.md)
+and [#274](https://github.com/Mudcrab-Team/mudcrab/issues/274).
 
 Each mip is padded to whole 4x4 blocks by replicating edge pixels, so 1x1 and odd-sized mips keep
 the block counts the container expects; rows that already fill whole blocks are compressed where
@@ -70,17 +78,20 @@ formats, palettes and L8 also fall back to UASTC. Under `--texture-encoder gpu` 
 encoded to UASTC on the GPU instead.
 
 The combined native-BC DDS, authored surface-input and corrected TXST semantic producer arrived in
-converter schema 26; the current producer is 27 (collision coverage), with the same texture contract.
+converter schema 26; producer 27 added collision coverage. The current producer is 28, which
+corrects KTX2 physical mip order and alignment through [#222](https://github.com/Mudcrab-Team/mudcrab/pull/222)
+without selecting a portable profile.
 Texture-set TX02 selects environment-mask linear data,
 TX03 emissive color, TX04 height linear data and TX05 environment-cube color.
 Schema 18 was allocated independently to native-BC DDS and specular changes, so its numeric identity
-cannot prove mesh or texture compatibility. Manifests from known schemas 12–24 and 26 rebuild all
-textures, GLBs and world outputs. Producer 24's explicitly compatible GLB contract ends with producer
-27, which changes GLB collision data, so no earlier GLBs remain reusable. Source/configuration/output-verified
-scripts and archive ingestion remain reusable. Configuration hashes since schema 22 include CPU/GPU
+cannot prove mesh or texture compatibility. Known older producers rebuild textures; mesh reuse
+also requires the current named output contracts and source/settings/output proof in
+[`cache.rs`](../../../crates/converter/src/cache.rs). Verified scripts and archive ingestion
+remain reusable. Configuration hashes since schema 22 include CPU/GPU
 encoder selection and GPU quality; GPU batch size changes scheduling only. Staged outputs
-require exact current schema 27 provenance. Earlier texture bytes are never promoted to current
-output. Metadata-only rebuilds retain original asset provenance and do not repair old encodings.
+require exact current schema 28 provenance. Earlier texture bytes are never promoted to current
+output. Metadata-only rebuilds retain asset provenance and reject pre-28 texture packs rather
+than relabeling old bytes.
 
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
 output through `ktx2_buffer_to_image` verifying GPU format, dimensions, and mip count.

@@ -14,6 +14,13 @@ from model_inspector import forwarding, host, processes, runtime
 
 
 class InspectorTests(unittest.TestCase):
+    def test_native_fault_detection_distinguishes_lowercase_error_from_failure(self):
+        for line in ['INSPECTOR_INPUT meshes/clutter/error.glb', 'INFO: recoverable error']:
+            self.assertIsNone(runtime.FAULT.search(line), line)
+        for line in ['ERROR renderer failed', 'INSPECTOR_LOAD_FAILED', 'INSPECTOR_LOAD_TIMEOUT',
+                     'thread panicked at source', 'Validation Error', 'DEVICE LOST']:
+            self.assertIsNotNone(runtime.FAULT.search(line), line)
+
     def test_invalid_catalog_has_no_run_or_reservation_side_effect(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(FileNotFoundError):
