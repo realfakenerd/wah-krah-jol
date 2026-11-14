@@ -740,31 +740,33 @@ impl GpuUastc {
                 .map(|_| None)
                 .collect::<Vec<Option<Result<EncodedTexture>>>>(),
         );
-        let (sender, receiver) = job_channel(self);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                for (tag, texture) in textures.into_iter().enumerate() {
-                    if let Err(job) = sender.send(GpuJob {
-                        texture,
-                        encoding,
-                        tag,
-                    }) {
-                        results.lock().unwrap()[job.tag] =
-                            Some(Err(eyre!("GPU became unavailable while queuing RGBA mips")));
-                    }
-                }
-                drop(sender);
-            });
-            run_batcher(
-                self,
-                receiver,
-                post_threads,
-                || false,
-                |tag, result| {
-                    results.lock().unwrap()[tag] = Some(result);
-                },
-            );
-        });
+        // This batch is already bounded and owned by the caller. Queue its existing bytes
+        // directly, avoiding an extra producer thread that could fail to start.
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let budget = Arc::new(ByteBudget::new(u64::MAX));
+        for (tag, texture) in textures.into_iter().enumerate() {
+            let job = GpuJob {
+                texture,
+                encoding,
+                tag,
+            };
+            budget.acquire(job.upload_len());
+            // The receiver is held here until run_batcher takes it.
+            let _ = sender.send(job);
+        }
+        drop(sender);
+        run_batcher(
+            self,
+            JobReceiver {
+                jobs: receiver,
+                budget,
+            },
+            post_threads,
+            || false,
+            |tag, result| {
+                results.lock().unwrap()[tag] = Some(result);
+            },
+        );
         results
             .into_inner()
             .unwrap()
@@ -1286,6 +1288,60 @@ pub(crate) struct BatchStats {
 /// Item for the writer threads: a built KTX2, or why the texture was not encoded.
 type Pending<T> = (T, TextureEncoding, Result<BuiltKtx2>);
 
+/// Return every queued job to the caller's CPU fallback, releasing queue reservations first.
+/// Keep draining until producers finish; a startup failure must not lose work or block senders.
+fn reject_jobs<T>(
+    jobs: &JobReceiver<T>,
+    stopped: &impl Fn() -> bool,
+    done: &impl Fn(T, Result<EncodedTexture>),
+    reason: &str,
+) {
+    for job in jobs.jobs.iter() {
+        jobs.budget.release(job.upload_len());
+        if !stopped() {
+            done(job.tag, Err(eyre!("GPU worker unavailable: {reason}")));
+        }
+    }
+}
+
+fn post_pool_or_fallback<T>(
+    pool: std::result::Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+    jobs: &JobReceiver<T>,
+    stopped: &impl Fn() -> bool,
+    done: &impl Fn(T, Result<EncodedTexture>),
+) -> Option<rayon::ThreadPool> {
+    match pool {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            reject_jobs(jobs, stopped, done, &error.to_string());
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAILED_WORKER: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+fn spawn_scoped_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: String,
+    work: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if FAILED_WORKER.with(|failed| failed.get().is_some_and(|failed| failed == name)) {
+        return Err(std::io::Error::other("injected GPU worker startup failure"));
+    }
+    std::thread::Builder::new()
+        .name(name)
+        .spawn_scoped(scope, work)
+}
+
 /// Encodes every job arriving on `jobs` until all senders are dropped, and
 /// calls `done` (from `threads` writer threads, in any order) with each job's
 /// tag and its validated KTX2, or the error that kept the GPU from encoding
@@ -1300,11 +1356,17 @@ pub(crate) fn run_batcher<T: Send>(
 ) -> BatchStats {
     let _batcher = gpu.batcher_lock.lock().unwrap();
     let threads = threads.max(1);
-    let post_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|index| format!("texture-gpu-post-{index}"))
-        .build()
-        .expect("texture post-processing pool");
+    let Some(post_pool) = post_pool_or_fallback(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("texture-gpu-post-{index}"))
+            .build(),
+        &jobs,
+        &stopped,
+        &done,
+    ) else {
+        return BatchStats::default();
+    };
     let (flight_tx, flight_rx) = crossbeam_channel::bounded::<InFlight<T>>(SLOTS);
     let (slot_tx, slot_rx) = crossbeam_channel::bounded::<Slot>(SLOTS);
     let stats = Mutex::new(BatchStats::default());
@@ -1312,15 +1374,15 @@ pub(crate) fn run_batcher<T: Send>(
     let (write_tx, write_rx) = crossbeam_channel::unbounded::<Pending<T>>();
     let (done, stopped, stats_ref, post_pool, budget) =
         (&done, &stopped, &stats, &post_pool, &budget);
+    let mut took_slots = false;
 
     std::thread::scope(|scope| {
         // Writers: validate, hash and hand each texture to `done` (which
         // writes it), in parallel and decoupled from the GPU slots.
         for index in 0..threads {
             let write_rx = write_rx.clone();
-            std::thread::Builder::new()
-                .name(format!("texture-gpu-write-{index}"))
-                .spawn_scoped(scope, move || {
+            let spawned =
+                spawn_scoped_worker(scope, format!("texture-gpu-write-{index}"), move || {
                     for (tag, encoding, built) in write_rx {
                         let len = built.as_ref().map_or(0, |built| built.bytes.len() as u64);
                         if !stopped() {
@@ -1333,8 +1395,16 @@ pub(crate) fn run_batcher<T: Send>(
                         }
                         budget.release(len);
                     }
-                })
-                .expect("spawn texture writer");
+                });
+            if let Err(error) = spawned {
+                eprintln!("GPU texture writer unavailable ({error}); using {index} writer(s)");
+                if index == 0 {
+                    drop(write_tx);
+                    reject_jobs(&jobs, stopped, done, &error.to_string());
+                    return;
+                }
+                break;
+            }
         }
         drop(write_rx);
 
@@ -1350,6 +1420,7 @@ pub(crate) fn run_batcher<T: Send>(
                 return;
             }
         };
+        took_slots = true;
         // One slot starts in the batcher's hands, the rest wait here.
         let first_slot = slots.pop().expect("take_slots returns SLOTS slots");
         for slot in slots {
@@ -1361,7 +1432,7 @@ pub(crate) fn run_batcher<T: Send>(
         // files for the writers.
         let readback_write_tx = write_tx.clone();
         let return_slot_tx = slot_tx.clone();
-        scope.spawn(move || {
+        let readback = spawn_scoped_worker(scope, "texture-gpu-readback".into(), move || {
             for flight in flight_rx {
                 let waited = gpu.wait(&flight);
                 let readback_len = flight.batch.readback_len();
@@ -1429,6 +1500,15 @@ pub(crate) fn run_batcher<T: Send>(
                 stats.textures += count;
             }
         });
+        if let Err(error) = readback {
+            // No dispatch has started. Return every slot, stop the idle writers, and hand
+            // queued textures back to CPU encoding without waiting on a missing reader.
+            let _ = return_slot_tx.send(first_slot);
+            drop(flight_tx);
+            drop(write_tx);
+            reject_jobs(&jobs, stopped, done, &error.to_string());
+            return;
+        }
 
         // Batcher: stream textures into the current slot, dispatch when full.
         let mut source_bytes = 0u64;
@@ -1467,13 +1547,93 @@ pub(crate) fn run_batcher<T: Send>(
         drop(write_tx);
         stats.lock().unwrap().source_bytes += source_bytes;
     });
-    *gpu.slots.lock().unwrap() = slot_rx.try_iter().collect();
+    if took_slots {
+        *gpu.slots.lock().unwrap() = slot_rx.try_iter().collect();
+    }
     stats.into_inner().unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_startup_failure_returns_every_job_and_unblocks_producers() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let budget = Arc::new(ByteBudget::new(64));
+        let sender = JobSender {
+            jobs: tx,
+            budget: Arc::clone(&budget),
+            health: Arc::new(Health::default()),
+        };
+        let receiver = JobReceiver {
+            jobs: rx,
+            budget: Arc::clone(&budget),
+        };
+        let producer = std::thread::spawn(move || {
+            for tag in 0..4 {
+                let texture = PreparedTexture::from_rgba_mips(4, 4, &[vec![255; 64]]).unwrap();
+                assert!(
+                    sender
+                        .send(GpuJob {
+                            texture,
+                            encoding: TextureEncoding::ColorSrgb,
+                            tag
+                        })
+                        .is_ok()
+                );
+            }
+        });
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .spawn_handler(|_| Err(std::io::Error::other("injected thread limit")))
+            .build();
+        let mut returned = Vec::new();
+        let returned = Mutex::new(&mut returned);
+        assert!(
+            post_pool_or_fallback(pool, &receiver, &|| false, &|tag, result| {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("injected thread limit")
+                );
+                returned.lock().unwrap().push(tag);
+            })
+            .is_none()
+        );
+        producer.join().unwrap();
+        assert_eq!(**returned.lock().unwrap(), [0, 1, 2, 3]);
+        assert_eq!(budget.state.lock().unwrap().used, 0);
+    }
+
+    #[test]
+    fn stopped_worker_fallback_releases_jobs_without_running_callbacks() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let budget = Arc::new(ByteBudget::new(64));
+        budget.acquire(64);
+        let texture = PreparedTexture::from_rgba_mips(4, 4, &[vec![255; 64]]).unwrap();
+        assert!(
+            tx.send(GpuJob {
+                texture,
+                encoding: TextureEncoding::ColorSrgb,
+                tag: ()
+            })
+            .is_ok()
+        );
+        drop(tx);
+        reject_jobs(
+            &JobReceiver {
+                jobs: rx,
+                budget: Arc::clone(&budget),
+            },
+            &|| true,
+            &|_, _| panic!("cancelled work ran"),
+            "thread limit",
+        );
+        assert_eq!(budget.state.lock().unwrap().used, 0);
+    }
 
     #[test]
     fn prepared_rgba_mips_preserve_authored_levels_and_layout() {
@@ -1513,6 +1673,60 @@ mod tests {
         assert!(PreparedTexture::from_rgba_mips(4, 4, &[vec![0; 64], vec![0; 15]]).is_err());
         assert!(PreparedTexture::from_rgba_mips(1, 1, &[vec![0; 4], vec![0; 4]]).is_err());
         assert!(PreparedTexture::from_rgba_mips(u32::MAX, 1, &[vec![]]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an idle hardware GPU"]
+    fn worker_startup_failures_return_jobs_and_keep_gpu_slots_reusable() {
+        struct ResetWorker;
+        impl Drop for ResetWorker {
+            fn drop(&mut self) {
+                FAILED_WORKER.with(|failed| failed.set(None));
+            }
+        }
+        let _reset = ResetWorker;
+        let gpu = GpuUastc::new(DEFAULT_QUALITY, 1).unwrap();
+        let levels = vec![vec![255; 8 * 8 * 4]];
+        for worker in [
+            "texture-gpu-write-0",
+            "texture-gpu-write-1",
+            "texture-gpu-readback",
+        ] {
+            FAILED_WORKER.with(|failed| failed.set(Some(worker)));
+            let outputs = gpu.encode_prepared_batch(
+                (0..4)
+                    .map(|_| PreparedTexture::from_rgba_mips(8, 8, &levels).unwrap())
+                    .collect(),
+                TextureEncoding::ColorSrgb,
+                2,
+            );
+            assert_eq!(outputs.len(), 4);
+            for output in outputs {
+                if worker == "texture-gpu-write-1" {
+                    output.unwrap(); // The first writer still drains every job.
+                } else {
+                    assert!(
+                        output
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("injected GPU worker startup failure")
+                    );
+                }
+            }
+            assert_eq!(gpu.slots.lock().unwrap().len(), SLOTS);
+        }
+        FAILED_WORKER.with(|failed| failed.set(None));
+        assert!(
+            gpu.encode_prepared_batch(
+                vec![PreparedTexture::from_rgba_mips(8, 8, &levels).unwrap()],
+                TextureEncoding::ColorSrgb,
+                1,
+            )
+            .pop()
+            .unwrap()
+            .is_ok()
+        );
     }
 
     #[test]

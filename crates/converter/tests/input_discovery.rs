@@ -1,4 +1,4 @@
-//! Discovery failures must stop conversion before publication.
+//! Inaccessible source descendants are isolated; internal staging failures remain fatal.
 #![cfg(unix)]
 
 use converter::{
@@ -97,8 +97,25 @@ fn assert_discovery_failure(
     )));
 }
 
+fn file_listing(root: &Path) -> Vec<String> {
+    let mut files: Vec<String> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string()
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 #[tokio::test]
-async fn unreadable_data_subtree_stops_conversion_and_preserves_published_output() {
+async fn unreadable_data_subtree_is_isolated_unless_fail_fast_is_requested() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let output = directory.path().join("modern");
@@ -111,6 +128,11 @@ async fn unreadable_data_subtree_stops_conversion_and_preserves_published_output
     let unreadable = data.join("scripts/blocked");
     fs::create_dir_all(&unreadable).unwrap();
     fs::write(unreadable.join("hidden.pex"), b"hidden input").unwrap();
+    fs::write(
+        data.join("scripts/good.pex"),
+        dummy_content::pex::minimal("Good").unwrap(),
+    )
+    .unwrap();
     let permissions = fs::metadata(&unreadable).unwrap().permissions();
     let _restore_permissions = RestorePermissions {
         path: &unreadable,
@@ -121,12 +143,70 @@ async fn unreadable_data_subtree_stops_conversion_and_preserves_published_output
         // Privileged runners can bypass Unix permissions.
         return;
     }
-    let (result, events) = run(config).await;
+    config.fail_fast = true;
+    let (result, events) = run(config.clone()).await;
 
     assert_discovery_failure(result, &events, &data, &unreadable);
     assert_eq!(
         fs::read(output.join("conversion-manifest.json")).unwrap(),
         manifest
+    );
+
+    // The previous pack is complete, so an incomplete result must not replace it.
+    config.fail_fast = false;
+    let output_files = file_listing(&output);
+    let (result, events) = run(config.clone()).await;
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("refusing to replace the complete pack"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&unreadable.display().to_string()),
+        "{message}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.stage,
+        ProgressStage::Publishing | ProgressStage::Complete
+    )));
+    assert_eq!(
+        fs::read(output.join("conversion-manifest.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(file_listing(&output), output_files);
+    assert!(!output.join("scripts/good.luau").exists());
+
+    // With no complete pack to lose, the same run isolates the folder and publishes.
+    let fresh_output = directory.path().join("fresh");
+    config.output_dir = fresh_output.clone();
+    let output = fresh_output;
+    let (result, events) = run(config).await;
+    let report = result.unwrap();
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 1);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(&unreadable.display().to_string()))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.stage == ProgressStage::Publishing)
+    );
+    assert!(output.join("scripts/good.luau").is_file());
+    assert!(!output.join("scripts/blocked/hidden.luau").exists());
+    let published: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(published["complete"], false);
+    assert!(
+        published["failures"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains("blocked"))
     );
 }
 

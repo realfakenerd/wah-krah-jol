@@ -3,8 +3,8 @@ use crate::{
     archive::{ArchiveExtractor, archive_reader_version, safe_relative_path},
     asset_path::{AssetKind, canonical_asset_path, is_authoring_resource, resolve_asset_uri},
     cache::{
-        CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, configuration_hash, hash_file,
-        link_or_copy,
+        CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, IngestionCacheEntry,
+        configuration_hash, hash_file, link_or_copy,
     },
     check::{CheckMode, CheckProblem, check_output},
     config::{PipelineConfig, TextureEncoder},
@@ -54,6 +54,12 @@ struct Source {
 }
 
 /// Maps a supported source extension to its asset kind, source extension, and output extension.
+pub(crate) fn kind_for_recovery_key(
+    path: &Path,
+) -> Option<(AssetKind, &'static str, &'static str)> {
+    kind(&path.to_string_lossy())
+}
+
 fn kind(path: &str) -> Option<(AssetKind, &'static str, &'static str)> {
     match Path::new(path)
         .extension()?
@@ -277,12 +283,72 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
         .iter()
         .map(|(key, path)| (path.clone(), key.clone()))
         .collect();
-    let mut targets: BTreeSet<String> = manifest
-        .failures
-        .keys()
-        .filter(|key| kind(key).is_some())
-        .cloned()
+    let active_archive_keys: BTreeSet<String> = archives
+        .iter()
+        .filter_map(|archive| archive_keys.get(archive).cloned())
         .collect();
+    let original_failures = manifest.failures.clone();
+    let resolved_loose_keys = resolved_loose_asset_keys(&resolved);
+    let mut legacy_asset_failures = BTreeMap::<String, String>::new();
+    let mut directory_targets = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
+    let mut targets = BTreeSet::<String>::new();
+    for failure_key in original_failures.keys() {
+        let physical = resolve_data_path(failure_key, &config.data_dir);
+        if let Some(directory_path) = physical.as_deref().filter(|path| path.is_dir()) {
+            let Some(relative_directory) = directory_path.strip_prefix(&config.data_dir).ok()
+            else {
+                continue;
+            };
+            let prefixes = directory_canonical_prefixes(relative_directory)?;
+            if prefixes.is_empty() {
+                manifest.failures.insert(
+                    failure_key.clone(),
+                    "directory path cannot be mapped to a supported source namespace".into(),
+                );
+                continue;
+            }
+            if config.mo2.is_none()
+                && let Some(loose_targets) = directory_subtree_targets(directory_path, &resolved)?
+            {
+                directory_targets.insert(failure_key.clone(), (prefixes, loose_targets));
+            } else {
+                manifest.failures.insert(
+                    failure_key.clone(),
+                    "directory rescan is incomplete or includes inputs that require normal conversion".into(),
+                );
+            }
+            continue;
+        }
+        if let Some(key) = recoverable_failure_asset_key(failure_key, &config.data_dir) {
+            let message = original_failures
+                .get(failure_key)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let requires_loose_source = Path::new(failure_key).is_absolute()
+                || message.starts_with("skipped input ")
+                || message.starts_with("skipped loose asset ");
+            if requires_loose_source {
+                let has_loose_source =
+                    if Path::new(failure_key).is_absolute() && config.mo2.is_none() {
+                        physical
+                            .filter(|path| path.is_file())
+                            .is_some_and(|physical_file| {
+                                resolved.values().any(|source| source == &physical_file)
+                            })
+                    } else {
+                        resolved_loose_keys.contains(&key)
+                    };
+                if !has_loose_source {
+                    // A known loose failure must not fall back to an archive winner.
+                    continue;
+                }
+            }
+            targets.insert(key.clone());
+            if key != *failure_key {
+                legacy_asset_failures.insert(failure_key.clone(), key);
+            }
+        }
+    }
     let mut sources = BTreeMap::<String, Source>::new();
     let cache = config.ingestion_cache_dir().join(".ingestion-cache");
     let new_cache = directory.join(".ingestion-cache");
@@ -311,11 +377,7 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
                 None,
             ) {
                 Ok(outcome) => {
-                    for file in &outcome.cache_entry.files {
-                        if kind(&file.path).is_some() {
-                            targets.insert(file.path.clone());
-                        }
-                    }
+                    targets.extend(unique_archive_asset_keys(&outcome.cache_entry, &archive)?);
                     manifest
                         .archives
                         .insert(archive_key.clone(), outcome.cache_entry);
@@ -347,10 +409,12 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
                 current_reader_version
             );
         }
+        unique_archive_asset_keys(entry, &archive)?;
         for file in &entry.files {
-            if kind(&file.path).is_none() {
+            let Some((asset_kind, ext, _)) = kind(&file.path) else {
                 continue;
-            }
+            };
+            let source_key = canonical_asset_path(&file.path, asset_kind, ext)?;
             let hash = &file.hash;
             ensure!(
                 hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -361,7 +425,7 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
                 .join(&hash[..2])
                 .join(hash);
             sources.insert(
-                file.path.clone(),
+                source_key,
                 Source {
                     path: blob,
                     archive: Some((archive.clone(), entry.source_hash.clone())),
@@ -373,7 +437,9 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
     // Loose files override archives, just as in the main conversion pipeline.
     for (relative, path) in &resolved {
         if let Some((asset_kind, ext, _)) = kind(relative) {
-            let key = canonical_asset_path(relative, asset_kind, ext)?;
+            let Ok(key) = canonical_asset_path(relative, asset_kind, ext) else {
+                continue;
+            };
             ensure!(
                 !sources
                     .get(&key)
@@ -389,6 +455,59 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
                 },
             );
         }
+    }
+    let directory_checks = directory_targets.clone();
+    for (failure_key, (prefixes, loose_targets)) in directory_checks {
+        let failed_archive = active_archive_keys.iter().any(|archive_key| {
+            let path = resolved.get(archive_key);
+            path.is_some_and(|archive| {
+                manifest.failures.keys().any(|failure| {
+                    failure
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&archive.to_string_lossy().replace('\\', "/"))
+                })
+            })
+        });
+        let unsupported_archive_member = active_archive_keys.iter().any(|archive_key| {
+            manifest.archives.get(archive_key).is_some_and(|entry| {
+                entry.files.iter().any(|file| {
+                    key_matches_prefixes(&file.path, &prefixes) && kind(&file.path).is_none()
+                })
+            })
+        });
+        let unavailable_archive_member = manifest.archives.iter().any(|(archive_key, entry)| {
+            !active_archive_keys.contains(archive_key)
+                && entry.files.iter().any(|file| {
+                    key_matches_prefixes(&file.path, &prefixes)
+                        && !archive_file_has_current_winner(&file.path, &sources)
+                })
+        });
+        let missing_archive_inventory = active_archive_keys
+            .iter()
+            .any(|archive_key| !manifest.archives.contains_key(archive_key));
+        if failed_archive
+            || unsupported_archive_member
+            || unavailable_archive_member
+            || missing_archive_inventory
+        {
+            manifest.failures.insert(
+                failure_key.clone(),
+                "directory subtree includes unresolved archive or metadata inputs; run normal conversion".into(),
+            );
+            directory_targets.remove(&failure_key);
+            continue;
+        }
+        let mut children: BTreeSet<_> = sources
+            .keys()
+            .filter(|key| key_matches_prefixes(key, &prefixes))
+            .cloned()
+            .collect();
+        children.extend(
+            loose_targets
+                .into_iter()
+                .filter(|key| sources.contains_key(key)),
+        );
+        targets.extend(children);
     }
     // Keys stay logical so the resolver returns a source identity, not a
     // content-addressed blob two archives may share; values are readable paths
@@ -661,6 +780,28 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
             entry.output_hash = hash_file(&staged.join(&entry.output))?;
         }
     }
+    for (legacy_key, canonical_key) in legacy_asset_failures {
+        if !manifest.failures.contains_key(&canonical_key)
+            && (manifest.entries.contains_key(&canonical_key)
+                || manifest.excluded_inputs.contains_key(&canonical_key))
+        {
+            manifest.failures.remove(&legacy_key);
+        }
+    }
+    for (directory_key, (prefixes, loose_targets)) in directory_targets {
+        let unresolved_child = manifest.failures.keys().any(|key| {
+            prefixes
+                .iter()
+                .any(|prefix| failure_key_under_prefix(key, &config.data_dir, prefix))
+                || canonical_failure_asset_key(key, &config.data_dir)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|asset| loose_targets.contains(&asset))
+        });
+        if !unresolved_child {
+            manifest.failures.remove(&directory_key);
+        }
+    }
     report.failures = manifest.failures.clone();
     manifest.complete = false;
     manifest.save(&staged.join("conversion-manifest.json"))?;
@@ -671,8 +812,14 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
     if apply {
         ensure!(
             manifest.failures.is_empty(),
-            "repair still has {} failed inputs; original pack unchanged, see {}",
+            "repair still has {} failed inputs; original pack unchanged: {}; see {}",
             manifest.failures.len(),
+            manifest
+                .failures
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; "),
             directory.display()
         );
         ensure!(
@@ -718,6 +865,207 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
         )?;
     }
     Ok(report)
+}
+
+fn unique_archive_asset_keys(
+    entry: &IngestionCacheEntry,
+    archive: &Path,
+) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for file in &entry.files {
+        if let Some((asset_kind, ext, _)) = kind(&file.path)
+            && let Ok(key) = canonical_asset_path(&file.path, asset_kind, ext)
+        {
+            ensure!(
+                keys.insert(key.clone()),
+                "archive {} contains duplicate canonical source key {key}",
+                archive.display()
+            );
+        }
+    }
+    Ok(keys)
+}
+
+fn directory_subtree_targets(
+    directory: &Path,
+    resolved: &BTreeMap<String, PathBuf>,
+) -> Result<Option<BTreeSet<String>>> {
+    let mut observed = BTreeMap::<PathBuf, String>::new();
+    for (key, source) in resolved {
+        if source.starts_with(directory) {
+            let Some((asset_kind, ext, _)) = kind(key) else {
+                return Ok(None);
+            };
+            observed.insert(source.clone(), canonical_asset_path(key, asset_kind, ext)?);
+        }
+    }
+    let mut targets = BTreeSet::new();
+    for entry in WalkDir::new(directory).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            return Ok(None);
+        }
+        if entry.file_type().is_file() {
+            let Some(key) = observed.get(entry.path()) else {
+                return Ok(None);
+            };
+            targets.insert(key.clone());
+        }
+    }
+    Ok(Some(targets))
+}
+
+fn archive_file_has_current_winner(path: &str, sources: &BTreeMap<String, Source>) -> bool {
+    let Some((asset_kind, ext, _)) = kind(path) else {
+        return false;
+    };
+    canonical_asset_path(path, asset_kind, ext)
+        .ok()
+        .is_some_and(|key| sources.contains_key(&key))
+}
+
+fn directory_canonical_prefixes(relative: &Path) -> Result<BTreeSet<String>> {
+    let mut prefixes = BTreeSet::from([normalize_key_path(relative)]);
+    for (kind, ext) in [
+        (AssetKind::Texture, "dds"),
+        (AssetKind::Mesh, "nif"),
+        (AssetKind::Script, "pex"),
+        (AssetKind::LodSettings, "lod"),
+        (AssetKind::Animation, "hkx"),
+    ] {
+        let candidate = relative.join(format!("__unreadable__.{ext}"));
+        if let Ok(key) = canonical_asset_path(&candidate.to_string_lossy(), kind, ext)
+            && let Some(parent) = Path::new(&key).parent()
+        {
+            prefixes.insert(normalize_key_path(parent));
+        }
+    }
+    Ok(prefixes)
+}
+
+fn key_matches_prefixes(key: &str, prefixes: &BTreeSet<String>) -> bool {
+    let normalized = normalize_key_path(Path::new(key));
+    if prefixes
+        .iter()
+        .any(|prefix| normalized.starts_with(&format!("{prefix}/")))
+    {
+        return true;
+    }
+    let components = normalized.split('/').collect::<Vec<_>>();
+    ["textures", "meshes", "scripts", "lodsettings"]
+        .iter()
+        .any(|folder| {
+            components
+                .iter()
+                .rposition(|component| *component == *folder)
+                .is_some_and(|index| {
+                    let canonical = format!("{folder}/{}", components[index + 1..].join("/"));
+                    prefixes
+                        .iter()
+                        .any(|prefix| canonical.starts_with(&format!("{prefix}/")))
+                })
+        })
+}
+
+fn normalize_key_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn failure_key_under_prefix(key: &str, data_root: &Path, prefix: &str) -> bool {
+    resolve_data_path(key, data_root)
+        .and_then(|path| path.strip_prefix(data_root).ok().map(Path::to_path_buf))
+        .is_some_and(|relative| normalize_key_path(&relative).starts_with(&format!("{prefix}/")))
+}
+
+fn resolve_data_path(key: &str, data_root: &Path) -> Option<PathBuf> {
+    let path = Path::new(key);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(data_root).ok()?
+    } else {
+        path
+    };
+    let mut current = data_root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let requested = name.to_string_lossy();
+        if !current.is_dir() {
+            current.push(name);
+            for tail in components {
+                current.push(tail.as_os_str());
+            }
+            break;
+        }
+        let mut matches = fs::read_dir(&current)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&requested)
+            });
+        let first = matches.next();
+        if matches.next().is_some() {
+            return None;
+        }
+        if let Some(entry) = first {
+            if fs::symlink_metadata(entry.path())
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            current = entry.path();
+        } else {
+            current.push(name);
+            for tail in components {
+                current.push(tail.as_os_str());
+            }
+            break;
+        }
+    }
+    Some(current)
+}
+
+fn recoverable_failure_asset_key(key: &str, data_root: &Path) -> Option<String> {
+    canonical_failure_asset_key(key, data_root).ok().flatten()
+}
+
+fn resolved_loose_asset_keys(resolved: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
+    resolved
+        .keys()
+        .filter_map(|relative| {
+            let (asset_kind, ext, _) = kind(relative)?;
+            canonical_asset_path(relative, asset_kind, ext).ok()
+        })
+        .collect()
+}
+
+fn canonical_failure_asset_key(key: &str, data_root: &Path) -> Result<Option<String>> {
+    let path = PathBuf::from(key);
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(data_root) else {
+            return Ok(None);
+        };
+        relative
+    } else {
+        path.as_path()
+    };
+    let Some((asset_kind, ext, _)) = kind(&relative.to_string_lossy()) else {
+        return Ok(None);
+    };
+    Ok(Some(canonical_asset_path(
+        &normalize_key_path(relative),
+        asset_kind,
+        ext,
+    )?))
 }
 
 /// Attempts one staged repair, updating manifest entries and counts or recording the failure.
@@ -1087,6 +1435,23 @@ fn publish(output: &Path, staged: &Path, backup: &Path, changed: &BTreeSet<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_asset_failure_key_does_not_abort_repair_selection() {
+        let root = Path::new("/data");
+        assert!(recoverable_failure_asset_key("textures/bad%.dds", root).is_none());
+    }
+
+    #[test]
+    fn resolved_loose_asset_keys_canonicalize_nested_source_paths() {
+        let resolved = std::collections::BTreeMap::from([(
+            "Data/Authoring/Scripts/x.pex".to_string(),
+            PathBuf::from("/data/Authoring/Scripts/x.pex"),
+        )]);
+        let keys = resolved_loose_asset_keys(&resolved);
+        assert!(keys.contains("scripts/x.pex"));
+        assert!(!keys.contains("scripts/missing.pex"));
+    }
 
     fn texture_source(root: &Path, format: ddsfile::D3DFormat) -> PathBuf {
         let mut dds = ddsfile::Dds::new_d3d(ddsfile::NewD3dParams {
