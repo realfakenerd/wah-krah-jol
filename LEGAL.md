@@ -51,4 +51,6 @@ Mudcrab is an original, clean-room software engine reimplementation engineered i
 Original code in this repository is licensed under:
 - **GNU General Public License v3 or later** ([LICENSE](LICENSE))
 
-This license applies **exclusively** to the original source code written by contributors to Mudcrab. It does not grant any rights to third-party assets, trademarks, or proprietary formats.
+Some files are derived from other GPL-compatible projects and keep those projects' terms; they are listed in [THIRD_PARTY.md](THIRD_PARTY.md). In particular, shaders derived from Community Shaders are **GPL-3.0-only**, so a build containing them is distributed under GPL-3.0 only.
+
+This license applies **exclusively** to source code in this repository. It does not grant any rights to third-party assets, trademarks, or proprietary formats.

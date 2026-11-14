@@ -209,7 +209,8 @@ cargo nextest run --workspace --all-targets --no-fail-fast --no-tests=warn
 ## License and legal
 
 Mudcrab is licensed under the [GNU General Public License v3.0 or later](LICENSE)
-(`GPL-3.0-or-later`).
+(`GPL-3.0-or-later`). Some files derived from other projects keep their own terms; see
+[THIRD_PARTY.md](THIRD_PARTY.md).
 
 Mudcrab is an independent open-source game engine reimplementation. It does **not** contain or
 distribute any copyrighted game assets, artwork, 3D models, audio, or game data belonging to

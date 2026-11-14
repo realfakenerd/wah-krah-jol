@@ -367,6 +367,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
             SkyrimCinematicPostPlugin,
+        ))
+        // Bevy implements `Plugins` for tuples of at most 15, so the fog plugin sits between two groups
+        // that keep the original registration order.
+        .add_plugins(crate::height_fog::HeightFogPlugin)
+        .add_plugins((
             ConsolePlugin,
             crate::console_selection::ConsoleSelectionPlugin,
             crate::bug_report::BugReportPlugin,

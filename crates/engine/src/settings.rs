@@ -54,6 +54,10 @@ pub struct RenderingSettings {
     pub sky_brightness_scale: f32,
     pub fog: bool,
     pub fog_density_scale: f32,
+    pub height_fog: bool,
+    pub height_fog_density_scale: f32,
+    pub height_fog_falloff: f32,
+    pub height_fog_height: f32,
     pub water_reflections: bool,
     pub water_reflection_strength: f32,
     pub water_waves: bool,
@@ -128,6 +132,10 @@ impl Default for RenderingSettings {
             sky_brightness_scale: 1.0,
             fog: true,
             fog_density_scale: 1.0,
+            height_fog: false,
+            height_fog_density_scale: 1.0,
+            height_fog_falloff: crate::height_fog::DEFAULT_HEIGHT_FALLOFF,
+            height_fog_height: crate::height_fog::DEFAULT_HEIGHT,
             water_reflections: true,
             water_reflection_strength: 1.0,
             water_waves: true,
@@ -298,6 +306,13 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
     toggle!("Sky and fog", "Exterior distance fog", fog),
     number!(Graphics, "Sky and fog", "Fog-density multiplier", fog_density_scale; 0.0, 4.0, 0.1)
         .when(|s| s.fog),
+    toggle!("Sky and fog", "Exponential height fog", height_fog).when(|s| s.fog),
+    number!(Graphics, "Sky and fog", "Height-fog density multiplier", height_fog_density_scale; 0.0, 20.0, 0.25)
+        .when(|s| s.fog && s.height_fog),
+    number!(Graphics, "Sky and fog", "Height-fog falloff", height_fog_falloff; 0.05, 4.0, 0.05)
+        .when(|s| s.fog && s.height_fog),
+    number!(Graphics, "Sky and fog", "Height-fog base height", height_fog_height; -20000.0, 40000.0, 250.0)
+        .when(|s| s.fog && s.height_fog),
     toggle!("Water", "Water reflections", water_reflections),
     number!(Graphics, "Water", "Water reflection multiplier", water_reflection_strength; 0.0, 1.0, 0.1)
         .when(|s| s.water_reflections),
@@ -586,6 +601,18 @@ impl RenderingSettings {
         self.io_threads = config.io_threads;
         self.diagnostic_asset_fallbacks = config.diagnostic_asset_fallbacks;
         self.visual_profile = config.visual_profile.index();
+        if let Some(layer) = &config.height_fog {
+            self.seed_height_fog(layer);
+        }
+    }
+
+    /// Turns the height fog on with `layer`'s values, so the menu shows what the command line
+    /// asked for. The density is kept as a multiple of the default layer's.
+    pub(crate) fn seed_height_fog(&mut self, layer: &crate::height_fog::HeightFogLayer) {
+        self.height_fog = true;
+        self.height_fog_density_scale = layer.density / crate::height_fog::DEFAULT_DENSITY;
+        self.height_fog_falloff = layer.height_falloff;
+        self.height_fog_height = layer.height;
     }
 
     fn retain_explicit_launch_values(&mut self, config: &EngineConfig) {
@@ -628,6 +655,12 @@ impl RenderingSettings {
                 "--max-upload-mib-per-frame" => self.upload_mib = source.upload_mib,
                 "--io-threads" => self.io_threads = source.io_threads,
                 "--visual-profile" => self.visual_profile = source.visual_profile,
+                "--height-fog" => {
+                    self.height_fog = source.height_fog;
+                    self.height_fog_density_scale = source.height_fog_density_scale;
+                    self.height_fog_falloff = source.height_fog_falloff;
+                    self.height_fog_height = source.height_fog_height;
+                }
                 "--diagnostic-asset-fallbacks" => {
                     self.diagnostic_asset_fallbacks = source.diagnostic_asset_fallbacks
                 }
@@ -2179,6 +2212,37 @@ mod tests {
             (20, 250.0),
             "the explicit launch values still win on reload"
         );
+    }
+
+    #[test]
+    fn height_fog_flag_seeds_the_menu_and_beats_a_saved_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        save_settings(
+            &path,
+            &RenderingSettings {
+                height_fog: false,
+                height_fog_falloff: 2.0,
+                ..RenderingSettings::default()
+            },
+        )
+        .unwrap();
+        let args = ["--height-fog", "0.06,0.4,500"].map(String::from);
+
+        let (settings, mut file) = prepare_settings_at(&mut launch(&args), Some(path.clone()));
+        assert!(settings.height_fog);
+        assert_eq!(settings.height_fog_falloff, 0.4);
+        assert_eq!(settings.height_fog_height, 500.0);
+        assert!((settings.height_fog_density_scale - 2.0).abs() < 1e-5);
+
+        file.save(&settings);
+        let written = serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap())
+            .expect("the persisted bytes parse");
+        assert!(!written.height_fog, "the launch value is not written");
+        assert_eq!(written.height_fog_falloff, 2.0);
+
+        let (plain, _) = prepare_settings_at(&mut launch(&[]), Some(path));
+        assert!(!plain.height_fog, "without the flag the saved choice rules");
     }
 
     /// Without a valid file, the saved baseline for launch-owned fields is the menu default, and the

@@ -86,6 +86,8 @@ pub struct EngineConfig {
     pub sun_shadow_distance_limit: Option<f32>,
     /// Optional sun bearing clockwise from north and elevation above the horizon, in degrees.
     pub sun_position: Option<(f32, f32)>,
+    /// Optional exponential height-fog layer; `None` leaves the weather's distance fog alone.
+    pub height_fog: Option<crate::height_fog::HeightFogLayer>,
     pub terrain_lod: TerrainLodDistances,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
@@ -232,6 +234,7 @@ impl Default for EngineConfig {
             unload_radius: 3,
             sun_shadow_distance_limit: None,
             sun_position: None,
+            height_fog: None,
             terrain_lod: TerrainLodDistances::default(),
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
@@ -406,6 +409,7 @@ Benchmark and profiling:
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
+  --height-fog <density,falloff,height>  exponential height fog over exteriors (e.g. 0.03,0.5,-3000)
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
@@ -1257,6 +1261,18 @@ impl EngineConfig {
                         )
                     })?);
                 }
+                "--height-fog" => {
+                    let raw = take_raw("--height-fog", HEIGHT_FOG_EXPECTED, args.next())?;
+                    config.height_fog = Some(
+                        crate::height_fog::HeightFogLayer::parse(&raw).ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--height-fog",
+                                Some(raw),
+                                HEIGHT_FOG_EXPECTED,
+                            )
+                        })?,
+                    );
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -1440,6 +1456,10 @@ const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
 /// What `--sun-position` takes: azimuth clockwise from north, then elevation above the horizon.
 const SUN_POSITION_EXPECTED: &str =
     "two finite angles in degrees: azimuth,elevation (elevation 0 to 90)";
+
+/// What `--height-fog` takes, in the units of [`crate::height_fog::HeightFogLayer`].
+const HEIGHT_FOG_EXPECTED: &str =
+    "density,falloff,height: density >= 0, falloff > 0, height a world height in Skyrim units";
 
 /// Test shorthand for a command line that must ask for a run.
 #[cfg(test)]
@@ -2781,6 +2801,27 @@ mod tests {
                 "{value} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn parses_the_optional_height_fog_layer() {
+        assert_eq!(EngineConfig::default().height_fog, None);
+        let config = run_config(&["--height-fog", "0.02,0.3,-500"]);
+        assert_eq!(
+            config.height_fog,
+            Some(crate::height_fog::HeightFogLayer {
+                density: 0.02,
+                height_falloff: 0.3,
+                height: -500.0,
+            })
+        );
+        assert!(matches!(
+            parse_error(&["--height-fog", "0.02,0"]),
+            ConfigError::InvalidValue {
+                option: "--height-fog",
+                ..
+            }
+        ));
     }
 
     #[test]

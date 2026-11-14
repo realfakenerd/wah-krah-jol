@@ -25,6 +25,7 @@ the MIT notice below in its header.
 | Mudcrab file | Derived from (Community Shaders path) | License |
 |---|---|---|
 | `crates/engine/src/shaders/cs_lighting_msn.wgsl` | `package/Shaders/Lighting.hlsl` (model-space normal decode, world normal, `_s` glossiness, `GetFacegenBaseColor`, `GetFacegenRGBTintBaseColor`, the `HAIR` tint vertex colour) | MIT AND GPL-3.0-only |
+| `crates/engine/src/shaders/height_fog.wgsl` | `features/Exponential Height Fog/Shaders/ExponentialHeightFog/ExponentialHeightFog.hlsli`, `features/Exponential Height Fog/Shaders/ExponentialHeightFog/VolumetricFogCommon.hlsli`, `package/Shaders/ISSAOComposite.hlsl` | GPL-3.0-only |
 
 ## Bevy
 
