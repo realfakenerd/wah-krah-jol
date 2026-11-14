@@ -465,8 +465,8 @@ impl IngestionSelection {
     pub fn recipe(self) -> &'static str {
         match self {
             Self::All => "all-v1",
-            Self::ConverterInputsV1 => "converter-inputs-v2",
-            Self::RuntimeEnglishV1 => "runtime-english-v2",
+            Self::ConverterInputsV1 => "converter-inputs-v4",
+            Self::RuntimeEnglishV1 => "runtime-english-v4",
         }
     }
 
@@ -477,8 +477,8 @@ impl IngestionSelection {
     fn accepts_recipe(self, recipe: &str) -> bool {
         let proven = match recipe {
             "" | "all-v1" => Self::All,
-            "converter-inputs-v2" => Self::ConverterInputsV1,
-            "runtime-english-v2" => Self::RuntimeEnglishV1,
+            "converter-inputs-v4" => Self::ConverterInputsV1,
+            "runtime-english-v4" => Self::RuntimeEnglishV1,
             _ => return false,
         };
         proven.can_satisfy(self)
@@ -522,6 +522,35 @@ impl ExtractOptions {
 }
 
 impl ArchiveExtractor {
+    /// Inventories canonical paths without decompressing any payload.
+    pub fn list_paths(archive_path: &Path) -> Result<Vec<PathBuf>> {
+        let file = File::open(archive_path)?;
+        // SAFETY: this is a read-only mapping, held only while the archive is open.
+        let bytes = unsafe { Mmap::map(&file) }?;
+        let seen = std::cell::RefCell::new(BTreeMap::new());
+        let paths = std::cell::RefCell::new(Vec::new());
+        let record = |name: &str| -> Result<bool> {
+            let path = safe_relative_path(name)?;
+            detect_archive_collision(&mut seen.borrow_mut(), &path, name)?;
+            paths.borrow_mut().push(path);
+            Ok(false)
+        };
+        match bytes.get(..4) {
+            Some(b"BSA\0") => {
+                for entry in bsa::iter_raw_entries(&bytes)? {
+                    record(&entry.name)?;
+                }
+            }
+            Some(b"BTDX") => {
+                ba2::read_entries_matching(&bytes, record)?;
+            }
+            _ => bail!("unsupported archive magic in {}", archive_path.display()),
+        }
+        let mut paths = paths.into_inner();
+        paths.sort();
+        Ok(paths)
+    }
+
     /// Extracts only the selected inputs, reusing verified durable batches left
     /// by a previous run, including one interrupted before the archive completed.
     /// The source inode must stay immutable while its bytes are memory-mapped.
@@ -910,20 +939,14 @@ fn extract_selected_with_sync_reporting(
     }
 }
 
-/// Whether an archive path holds a Havok source the animation pass decodes: the character
-/// skeleton or one of the character animation clips. Behaviour graphs and unrelated clips are
-/// not converter inputs.
+/// Keep authored Havok metadata beside its clips. RACE projects may live outside
+/// actors/ (including Creation Club), and neither rig nor idle names are universal.
 pub(crate) fn is_animation_input(path: &Path) -> bool {
     let lower = path
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    let path = Path::new(&lower);
-    if path.extension().and_then(|extension| extension.to_str()) != Some("hkx") {
-        return false;
-    }
-    path == Path::new("meshes/actors/character/character assets/skeleton.hkx")
-        || path.starts_with("meshes/actors/character/animations")
+    lower.starts_with("meshes/") && lower.ends_with(".hkx")
 }
 
 fn selection_includes(selection: IngestionSelection, path: &Path) -> bool {
@@ -2133,12 +2156,65 @@ mod tests {
     }
 
     #[test]
+    fn inventory_returns_canonical_sorted_paths_without_materializing_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = mixed_archive(directory.path());
+        let paths = ArchiveExtractor::list_paths(&archive).unwrap();
+        assert_eq!(paths.len(), 14);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(paths.contains(&PathBuf::from(
+            "meshes/actors/character/behaviors/0_master.hkx"
+        )));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        let ba2 = directory.path().join("test.ba2");
+        fs::write(
+            &ba2,
+            dummy_content::ba2::general(
+                &[
+                    dummy_content::Entry::new("Meshes/B.hkx", b"payload"),
+                    dummy_content::Entry::new("meshes/a.hkx", b"other"),
+                ],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ArchiveExtractor::list_paths(&ba2).unwrap(),
+            vec![PathBuf::from("meshes/a.hkx"), PathBuf::from("meshes/b.hkx")]
+        );
+    }
+
+    #[test]
     fn extraction_timings_accept_reports_without_new_fields() {
         let timings: ExtractionTimings =
             serde_json::from_value(serde_json::json!({"extraction_seconds": 1.5})).unwrap();
         assert_eq!(timings.extraction_seconds, 1.5);
         assert_eq!(timings.cache_link_seconds, 0.0);
         assert_eq!(timings.sync_calls, 0);
+    }
+
+    #[test]
+    fn creature_idle_selection_requires_the_new_filtered_recipe() {
+        for selection in [
+            IngestionSelection::ConverterInputsV1,
+            IngestionSelection::RuntimeEnglishV1,
+        ] {
+            for profile in shared::creature_idle::CREATURE_IDLES {
+                for path in [profile.clip_source, profile.skeleton_hkx] {
+                    assert!(selection.includes(Path::new(path)));
+                    assert!(selection.includes(Path::new(&path.to_uppercase().replace('/', "\\"))));
+                }
+            }
+            assert!(selection.accepts_recipe(selection.recipe()));
+            assert!(selection.accepts_recipe("all-v1"));
+            assert!(!selection.accepts_recipe("converter-inputs-v2"));
+            assert!(!selection.accepts_recipe("converter-inputs-v3"));
+            assert!(!selection.accepts_recipe("runtime-english-v2"));
+            assert!(!selection.accepts_recipe("runtime-english-v3"));
+            assert!(selection.includes(Path::new("meshes/actors/cow/animations/walkforward.hkx")));
+            assert!(selection.includes(Path::new("meshes/actors/cow/behaviors/noncombatidle.hkx")));
+        }
     }
 
     #[test]
@@ -2155,13 +2231,13 @@ mod tests {
             ("strings/test.english.strings", false),
             ("strings/subdir/test_english.strings", false),
             ("sound/test.wav", false),
-            ("meshes/animation.hkx", false),
+            ("meshes/animation.hkx", true),
             (
                 "Meshes/Actors/Character/Character Assets/skeleton.hkx",
                 true,
             ),
             ("meshes/actors/character/animations/male/mt_idle.hkx", true),
-            ("meshes/actors/character/behaviors/0_master.hkx", false),
+            ("meshes/actors/character/behaviors/0_master.hkx", true),
         ] {
             assert_eq!(
                 selection_includes(IngestionSelection::RuntimeEnglishV1, Path::new(path)),
@@ -2184,8 +2260,8 @@ mod tests {
                 "meshes/actors/character/animations/female/mt_idle.hkx",
                 true,
             ),
-            ("meshes/actors/character/behaviors/0_master.hkx", false),
-            ("meshes/animations/furniture/chair.hkx", false),
+            ("meshes/actors/character/behaviors/0_master.hkx", true),
+            ("meshes/animations/furniture/chair.hkx", true),
         ] {
             assert_eq!(
                 selection_includes(IngestionSelection::ConverterInputsV1, Path::new(path)),
@@ -2232,12 +2308,12 @@ mod tests {
         )
         .unwrap();
         assert!(subset.cache_hit);
-        assert_eq!(subset.files.len(), 10);
+        assert_eq!(subset.files.len(), 11);
         assert_eq!(
             subset.cache_entry.selection,
             IngestionSelection::RuntimeEnglishV1
         );
-        assert_eq!(count_files(&subset_cache), 10);
+        assert_eq!(count_files(&subset_cache), 11);
         assert!(!subset_output.join("sound/test.wav").exists());
         assert!(!subset_output.join("strings/Test_french.strings").exists());
         assert!(
@@ -2251,7 +2327,7 @@ mod tests {
                 .is_file()
         );
         assert!(
-            !subset_output
+            subset_output
                 .join("meshes/actors/character/behaviors/0_master.hkx")
                 .exists()
         );
@@ -2301,11 +2377,11 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(outcome.files.len(), 10);
+            assert_eq!(outcome.files.len(), 11);
             assert_eq!(
                 outcome.timings.sync_calls,
                 if mode == IngestionSync::PerFile {
-                    10
+                    11
                 } else {
                     0
                 }
@@ -2355,9 +2431,9 @@ mod tests {
         )
         .unwrap();
         assert!(resumed.cache_hit);
-        assert_eq!(resumed.files.len(), 10);
-        assert_eq!(count_files(&output), 10);
-        assert_eq!(resumed.timings.payload_writes, 7);
+        assert_eq!(resumed.files.len(), 11);
+        assert_eq!(count_files(&output), 11);
+        assert_eq!(resumed.timings.payload_writes, 8);
         assert_eq!(resumed.timings.payload_reuses, 3);
         assert_eq!(resumed.timings.sync_calls, 0);
     }

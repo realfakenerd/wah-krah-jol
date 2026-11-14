@@ -3,8 +3,10 @@
 //! Only the Skyrim SE layout is supported: 64-bit pointers, three sections, and
 //! `hk_2010.2.0-r1`. The decoded clip is plain data; GLB emission belongs to a later stage.
 
+pub mod authoring;
 mod classes;
 pub mod glb;
+pub mod idle_defaults;
 mod packfile;
 mod spline;
 
@@ -21,6 +23,8 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnimationClip {
+    /// Havok hkaAnimationBinding blend hint: 0 is normal, 1 is additive.
+    pub blend_hint: u8,
     /// The packfile carries no clip name, so this is empty. Callers set it from the asset path.
     pub name: String,
     pub original_skeleton_name: String,
@@ -285,6 +289,7 @@ fn build_clip(
     }
 
     Ok(AnimationClip {
+        blend_hint: binding.blend_hint,
         name: String::new(),
         original_skeleton_name: binding.original_skeleton_name,
         duration_seconds: animation.duration,
@@ -383,6 +388,7 @@ mod tests {
 
     fn clip_with_bones(names: &[&str]) -> AnimationClip {
         AnimationClip {
+            blend_hint: 0,
             name: String::new(),
             original_skeleton_name: "NPC Root [Root]".to_owned(),
             duration_seconds: 1.0,

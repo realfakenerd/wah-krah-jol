@@ -33,11 +33,13 @@ pub fn load_runtime(lua: &Lua) -> Result<Table> {
     module.get::<Function>("new")?.call(())
 }
 
+/// Registers a class through the shared case-insensitive Papyrus name resolver.
 pub fn register_class(runtime: &Table, name: &str, class: Table) -> Result<()> {
     let register: Function = runtime.get("register_class")?;
     register.call((runtime.clone(), name, class))
 }
 
+/// Registers native names with the same case-insensitive policy as emitted calls.
 pub fn register_native(
     runtime: &Table,
     class_name: &str,
@@ -94,6 +96,50 @@ mod tests {
         let args = lua.create_sequence_from([21]).unwrap();
         let doubled: i64 = invoke.call((runtime, class, "Double", args)).unwrap();
         assert_eq!(doubled, 42);
+    }
+
+    /// Rust registrations retain host tables and resolve names independently of their spelling.
+    #[test]
+    fn host_registration_resolves_mixed_case_names() {
+        let lua = new_sandboxed_lua(8 * 1024 * 1024, 10_000).unwrap();
+        let runtime = load_runtime(&lua).unwrap();
+        let class: Table = lua
+            .load(
+                r#"return {
+            __name = 'HostClass', __parent = '', __autoState = '', Flag = false,
+            ['Busy::Value'] = function(self) return 47 end,
+            Value = function(self) return 11 end,
+            get_Counter = function(self) return self.counter end,
+            set_Counter = function(self, value) self.counter = value end,
+        }"#,
+            )
+            .eval()
+            .unwrap();
+        register_class(&runtime, "HOSTCLASS", class.clone()).unwrap();
+        let callback = lua
+            .create_function(|_, (_target, value): (Table, i64)| Ok(value + 3))
+            .unwrap();
+        register_native(&runtime, "hostclass", "DOUBLE", callback).unwrap();
+        lua.globals().set("rt", runtime).unwrap();
+        lua.globals().set("Class", class).unwrap();
+        lua.load(
+            r#"
+            assert(rt:resolve_identifier(nil, 'hOsTcLaSs') == Class)
+            local a = setmetatable({}, { __index = Class })
+            rt:call_method(a, 'gOtOsTaTe', {'bUsY'})
+            assert(rt:call_method(a, 'gEtStAtE', {}) == 'bUsY')
+            assert(rt:call_method(a, 'vAlUe', {}) == 47)
+            assert(rt:native(a, 'dOuBlE', {70}) == 73)
+            assert(rt:call_static('hostclass', 'VALUE', {}) == 11)
+            rt:set_property(a, 'COUNTER', 89)
+            assert(rt:get_property(a, 'counter') == 89)
+            rt:set_property(a, 'FLAG', true)
+            assert(a.Flag == true and a.FLAG == nil and Class.Flag == false)
+            assert(Class['Busy::Value'] ~= nil and Class.Value ~= nil, 'host keys retained')
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

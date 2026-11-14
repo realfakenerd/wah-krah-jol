@@ -34,6 +34,9 @@ SAFE_ENVIRONMENT = (
 )
 CAMERA_OFFSET = [0.0, 6000.0, 8000.0]
 SCENE_COUNTS = {"resident_cells": 25, "assets_ready": 2029, "terrain_patches_validated": 100}
+# Engine exit code for a lost GPU device (crates/engine/src/app.rs, EXIT_DEVICE_LOST). Such a run
+# measured nothing and is worth retrying, but repeated losses can still be the engine's fault.
+EXIT_DEVICE_LOST = 3
 EMPTY_QUEUES = (
     "loading_cells", "active_requests", "arming_queue_depth", "pending_asset_instances",
     "pending_surface_instances", "pending_lod_queries", "pending_lod_chunks", "retiring_cells",
@@ -254,7 +257,10 @@ def retry_accounting(logs, failures):
 def analyze_run(directory, manifest):
     failures = []
     notes = ["Visual inspection pending: lifecycle counters and PNG validity do not prove terrain pixel coverage."]
-    if manifest.get("exit_code") != 0 or manifest.get("timed_out") or manifest.get("interrupted"):
+    device_lost = manifest.get("exit_code") == EXIT_DEVICE_LOST
+    if device_lost:
+        failures.append(f"GPU device lost (engine exit code {EXIT_DEVICE_LOST}); retry the run")
+    elif manifest.get("exit_code") != 0 or manifest.get("timed_out") or manifest.get("interrupted"):
         failures.append("engine did not complete successfully")
     if manifest.get("input_hashes_before") != manifest.get("input_hashes_after"):
         failures.append("engine or primary asset inputs changed during the run")
@@ -386,6 +392,7 @@ def analyze_run(directory, manifest):
         failures.append(f"frames.csv: {error}")
     return {
         "functional_checks_passed": not failures,
+        "device_lost": device_lost,
         "visual_inspection": "pending",
         "failures": list(dict.fromkeys(failures)),
         "notes": notes,

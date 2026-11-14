@@ -1498,10 +1498,40 @@ armor -> every `ARMO/MODL` armature in authored order -> each `ARMA`:
 5. The slot is the armature's biped bit: bit 2 = body, bit 3 = hands, bit 7 = feet (slot number
    minus 30). The resolver reads `ARMA/BOD2` when present and falls back to `ARMA/BODT`, which is
    the field retail Skyrim's `ARMA` records actually carry (the same `u32` slot word at offset 0;
-   `ARMO` is the record with `BOD2`). An armature with neither recognized bit is rejected loudly
+   `ARMO` is the record with `BOD2`). Outside the creature whole-skin exception below, an armature with neither recognized bit is rejected loudly
    with an `unrecognized_slot` diagnostic; a slot is never inferred from the filename.
 6. Paths are deduplicated case-insensitively, and a slot already filled keeps the higher-priority
    armature.
+
+**Creature whole skins.** A non-FaceGen race with an authored project outside the shared
+character project family may store its whole skin in biped slot 30 (`BODT`/`BOD2` bit 0).
+When no ordinary body resolved, exactly one compatible head-slot model becomes the body.
+An ordinary body wins regardless of armature order; multiple distinct candidates remain
+unresolved with `ambiguous_creature_body`. Missing race flags or project metadata do not
+establish this exception. This preserves humanoid and child body selection.
+
+**Authored idle identity.** Every export creates the typed projection below with the other
+runtime tables. Full runtime exports replace its rows in the record transaction; archive-only
+record bundles keep the same empty table, like the other deferred runtime views. Metadata
+rebuilds therefore invalidate retained idle bindings when their race project or skeleton
+changes. The runtime accepts a catalog binding only when this table has a matching row. Older
+databases need no migration to render actors; they have no authenticated generic idle library
+until normal conversion produces one.
+
+```sql
+CREATE TABLE IF NOT EXISTS race_animation_sources (
+    race_id INTEGER NOT NULL,
+    sex TEXT NOT NULL,
+    skeleton_nif TEXT,
+    project_hkx TEXT,
+    PRIMARY KEY (race_id, sex)
+);
+```
+
+The converter follows project/character HKX metadata and publishes pose clips plus
+`meshes/actor-idles/catalog.json`. Runtime lookup requires race, sex, full body path, project,
+and race skeleton identity to agree. See [animal idle investigation](../../research/animal-idle-471.md)
+for discovery, supported playback, provenance, and validation limits.
 
 **Head.** The `RACE/DATA` `facegen_head` flag (bit 1 of the flags word at offset 32) selects the
 FaceGen geometry `meshes/actors/character/facegendata/facegeom/<plugin>/<formid>.nif`, lowercased,
@@ -1530,7 +1560,8 @@ export path has no asset index, so PR-6 validates the path before loading.
 resolution and skin overrides add nine codes: `missing_traits_template`, `deleted_traits_template`,
 `wrong_type_traits_template`, `traits_template_cycle`, `leveled_traits_template`,
 `zero_npc_skin_override`, `missing_npc_skin_override`, `deleted_npc_skin_override`, and
-`wrong_type_npc_skin_override`. A base that reaches head resolution but has no head path also
+`wrong_type_npc_skin_override`. A creature base with more than one slot-30 whole-skin candidate
+and no normal body records `ambiguous_creature_body`. A base that reaches head resolution but has no head path also
 records `no_facegen_and_no_default`; early returns for unresolved Traits, missing race links, or
 missing race records do not. The reasons are not mutually exclusive, and a report that counts
 them counts a base once per reason.

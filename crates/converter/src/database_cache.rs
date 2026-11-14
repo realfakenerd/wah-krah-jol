@@ -108,6 +108,8 @@ fn source_fingerprint() -> String {
     // the input identity also binds future modules, build flags and dependency code.
     let sources: &[&[u8]] = &[
         include_bytes!("asset_path.rs"),
+        include_bytes!("actor_models.rs"),
+        include_bytes!("animation/authoring.rs"),
         include_bytes!("esm/mod.rs"),
         include_bytes!("esm/binary.rs"),
         include_bytes!("esm/mmap_reader.rs"),

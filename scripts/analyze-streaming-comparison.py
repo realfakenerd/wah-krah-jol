@@ -29,6 +29,10 @@ EMPTY_ADMISSION = ("active_jobs", "queued_jobs", "orphan_active_jobs")
 # Identity a run must carry consistently in the manifest and its own run.json before pairing.
 PAIR_IDENTITY_KEYS = ("run_id", "pair_id", "scenario", "mode")
 ROUTE_SCENARIOS = ("normal", "stress", "ablation", "smoke-route")
+# Engine exit code for a lost GPU device (crates/engine/src/app.rs, EXIT_DEVICE_LOST). Such a run
+# measured nothing and is worth retrying, but repeated losses can still be the engine's fault.
+EXIT_DEVICE_LOST = 3
+DEVICE_LOST_ERROR = f"GPU device lost (engine exit code {EXIT_DEVICE_LOST}); retry the run"
 FAILURE_KEYS = (
     "failed_cells", "asset_load_failures", "material_validation_failures", "diagnostic_fallbacks",
     "terrain_validation_failures", "water_validation_failures", "transform_bounds_validation_failures",
@@ -550,6 +554,11 @@ def analyze_run(experiment, record):
     errors, warnings, censored = [], [], []
     result = {key: record.get(key) for key in ("run_id", "pair_id", "mode", "scenario", "order", "artifact_dir", "cache_policy", "analysis_exclusion")}
     result.update(valid=False, comparison_eligible=False, errors=errors, warnings=warnings, censored=censored, metrics={})
+    # Checked before the artifacts: a lost device usually ends the run before the engine writes its
+    # profile bundle, and the missing files must not hide why.
+    result["device_lost"] = record.get("exit_code") == EXIT_DEVICE_LOST
+    if result["device_lost"]:
+        errors.append(DEVICE_LOST_ERROR)
     try:
         directory = Path(record["artifact_dir"])
         trace = read_json(directory / "profile/streaming-frames.json")
@@ -577,7 +586,10 @@ def analyze_run(experiment, record):
     if not result["render_configuration"]["physical_resolution"] or not result["render_configuration"]["reported_build_profile"]:
         warnings.append("physical resolution or reported build profile unavailable for pair verification")
     result["host_observations"] = host
-    if record.get("exit_code", run.get("exit_code")) != 0 or run.get("exit_code") != 0:
+    if run.get("exit_code") == EXIT_DEVICE_LOST and not result["device_lost"]:
+        result["device_lost"] = True
+        errors.append(DEVICE_LOST_ERROR)
+    if not result["device_lost"] and (record.get("exit_code", run.get("exit_code")) != 0 or run.get("exit_code") != 0):
         errors.append("engine exit was not successful")
     if run.get("timed_out") or run.get("interrupted") or record.get("status") in ("timeout", "timed_out", "aborted", "interrupted"):
         errors.append("run was interrupted or timed out")

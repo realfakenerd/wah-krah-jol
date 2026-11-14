@@ -367,7 +367,16 @@ physical source paths and unrelated database rows are excluded. Historical v1
 proofs remain eligible for package-snapshot retention.
 `default-gait-v1` consumes the body NIF,
 skeleton NIF, skeleton HKX and the sex-specific gait HKX; it builds its bone tree
-from the NIF inputs. Original asset producer/settings provenance remains on the
+from the NIF inputs. `creature-idle-v1` records the explicit cow and chicken body
+NIF, skeleton NIF, skeleton HKX and `mt_idle.hkx` inputs. `authored-actor-idle-v2`
+records one converted body GLB, the project rig HKX, the source clip HKX and
+`recipes/authored-actor-idle-v2/tree/<sha256>.json`, the digest of that body's
+complete bone tree. Its output path is derived from those inputs without the body
+GLB, so bodies with an identical tree share one clip. `actor-idle-catalog-v1`
+records `recipes/actor-idle-catalog-v1/context.json` for
+`meshes/actor-idles/catalog.json`; the context digest covers every binding's
+inputs, unresolved and excluded bodies, clip issues and discovery issues. See
+[animal idle investigation](../../research/animal-idle-471.md). Original asset producer/settings provenance remains on the
 manifest. Material repair and texture pruning refresh the derived output hash
 to describe the published bytes.
 

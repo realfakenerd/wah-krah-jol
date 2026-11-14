@@ -102,6 +102,7 @@ fn mo2_profile_and_reader_bind_metadata_without_changing_asset_settings() {
 #[test]
 fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
     let mut legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
+    legacy.script_abi_version = 1; // These literal hashes record the historical ABI-1 settings.
     legacy.record_reader = RecordReader::Legacy;
     let historical = configuration_hash_for_schema(&legacy, CONVERTER_SCHEMA_VERSION).unwrap();
     let identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
@@ -154,6 +155,7 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
 #[test]
 fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     let mut config = PipelineConfig::new("synthetic-data", "synthetic-output");
+    config.script_abi_version = 1; // Reconstruct the fixed schema-15 ABI-1 proof below.
     config.record_reader = RecordReader::Legacy;
     let old_identity = serde_json::json!({"mode": "legacy"});
     let current_identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);

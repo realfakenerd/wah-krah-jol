@@ -863,6 +863,14 @@ fn publish_derived_output(
 /// Cleanup subtree recognition is intentionally broader and cannot establish provenance.
 pub(crate) fn supported_derived_proof(path: &str, proof: &crate::cache::DerivedOutput) -> bool {
     let mut inputs = BTreeSet::new();
+    if crate::pipeline::authored_actor_idle::supported_proof(path, proof) {
+        inputs.extend(proof.inputs.keys().cloned());
+    }
+    for profile in shared::creature_idle::CREATURE_IDLES {
+        if path == profile.clip_scene && proof.recipe == crate::cache::CREATURE_IDLE_RECIPE {
+            inputs.extend(profile.inputs().map(str::to_owned));
+        }
+    }
     for sex in ["male", "female"] {
         if path == format!("meshes/actors/character/composed/default/{sex}/body.glb")
             && matches!(

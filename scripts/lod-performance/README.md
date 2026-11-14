@@ -84,3 +84,75 @@ Run one exact check with `cargo test -p converter --profile quick --lib
 <test-name> -- --ignored --exact --nocapture`, or run its compiled test binary
 under `/usr/bin/time -l`. Use `--test fixture_lod_pipeline` for the integration
 check. Avoid overlapping benchmarks with builds, renderers or another converter.
+
+## Cluster timing receipt validation
+
+Validate one baseline run and one candidate run with the standard-library helper:
+
+```sh
+python3 scripts/validate-cluster-timing-receipt.py /path/to/cluster-timing-receipt.json
+```
+
+The following complete receipt is synthetic test data, not an engine measurement:
+
+```json
+{
+  "baseline": {
+    "frames_after_ready": 120,
+    "ready_to_complete_seconds": 2.5,
+    "guard_verdict": "pass",
+    "warmup_discarded": true,
+    "selection": {
+      "selected_instances": 100,
+      "suppressed_instances": 20,
+      "retained_native_lod": 5,
+      "lod_flags": {"object_lod": true, "terrain_lod": false}
+    }
+  },
+  "candidate": {
+    "frames_after_ready": 110,
+    "ready_to_complete_seconds": 2.3,
+    "guard_verdict": "pass",
+    "warmup_discarded": true,
+    "selection": {
+      "selected_instances": 100,
+      "suppressed_instances": 20,
+      "retained_native_lod": 5,
+      "lod_flags": {"object_lod": true, "terrain_lod": false}
+    }
+  }
+}
+```
+
+Every shown field is required. Each run has a positive integer
+`frames_after_ready` count and a positive finite numeric
+`ready_to_complete_seconds` duration. Booleans are not numbers for this contract.
+This receipt's `frames_after_ready` is a count, distinct from the engine pacing
+report's `frames_after_ready` statistics object. Exclude warmup from both the
+frame count and the elapsed seconds before writing the receipt.
+`warmup_discarded` must be exactly `true`, and `guard_verdict` must be `"pass"`.
+The helper validates these declarations; it does not independently inspect the
+warmup window or rerun the guard.
+
+`selection.selected_instances` counts selected instances,
+`selection.suppressed_instances` counts suppressed instances, and
+`selection.retained_native_lod` counts retained native LOD instances.
+All three counters must be nonnegative integers, excluding booleans.
+`selection.lod_flags` records the workload's LOD selection flags. It must be a
+nonempty object with nonempty string names and boolean values. The ordinary
+selection flags in the sample do not represent renderer implementation toggles.
+The baseline and candidate must have identical selection counters and identical
+flag names and values. Their timing counts and durations may differ.
+
+The helper prints `{"valid": true, "errors": []}` for a valid receipt and exits
+with status `0`. An invalid receipt, duplicate JSON key, malformed JSON, unreadable
+file, or invalid UTF-8 input produces `{"valid": false, "errors": [...]}` and
+status `1`. Field errors name their dotted paths. Invalid command usage exits
+with status `2` through `argparse`. Unknown annotation fields are allowed and
+carry no validated claims.
+
+Receipt validation establishes only this input contract and matched declared
+selection. It does not prove a performance improvement, equivalent visuals, GPU
+execution, or native behavior. Unavailable visual, GPU, or native evidence stays
+unavailable. No runtime receipt producer or repeated-run statistical analysis is
+included.

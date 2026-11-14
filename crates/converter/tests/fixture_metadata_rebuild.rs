@@ -659,7 +659,8 @@ async fn native_pre_producer_28_configuration_is_rejected_not_relabeled() {
     let output = directory.path().join("derived");
     generate(&data);
     convert(&data, &source).await;
-    let config = common::cpu_lod_config(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
+    config.script_abi_version = 1; // The literal schema-16 producer proof predates ABI 2.
     let producer_hash = native_configuration_hash(&config, 6);
     assert_eq!(
         producer_hash,

@@ -133,6 +133,7 @@ pub struct PipelineConfig {
     /// an omitted serialized field retains the legacy CPU recipe.
     #[serde(default)]
     pub lod_texture_encoder: TextureEncoder,
+    /// Script output ABI; full conversion raises saved values to the current emitter ABI.
     pub script_abi_version: u32,
     /// Language of the string tables localized plugins' names are read from, as in Skyrim's
     /// `sLanguage`: `Strings/<plugin>_<language>.STRINGS`.
@@ -210,7 +211,7 @@ impl PipelineConfig {
                 quality: crate::texture_gpu::DEFAULT_QUALITY,
                 batch_mb: crate::texture_gpu::DEFAULT_BATCH_MB,
             },
-            script_abi_version: 1,
+            script_abi_version: crate::script::SCRIPT_ABI_VERSION,
             language: default_language(),
         }
     }

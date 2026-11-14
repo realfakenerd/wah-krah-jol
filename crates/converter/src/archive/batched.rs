@@ -823,7 +823,7 @@ fn pack_directory(cache: &Path, source_hash: &str, recipe: &str) -> Result<PathB
     ensure!(
         matches!(
             recipe,
-            "all-v1" | "converter-inputs-v2" | "runtime-english-v2"
+            "all-v1" | "converter-inputs-v4" | "runtime-english-v4"
         ),
         "unknown ingestion recipe"
     );
@@ -1149,6 +1149,10 @@ pub(crate) fn prune_stale_reader_packs(
         for recipe in [
             ArchiveSelection::RuntimeEnglishV1.recipe(),
             ArchiveSelection::ConverterInputsV1.recipe(),
+            "runtime-english-v3",
+            "converter-inputs-v3",
+            "runtime-english-v2",
+            "converter-inputs-v2",
             "runtime-english-v1",
             "converter-inputs-v1",
             ArchiveSelection::All.recipe(),
@@ -1701,6 +1705,42 @@ mod tests {
         assert!(future_bsa.is_file());
         assert!(current_ba2.is_file());
         assert!(malformed.is_file());
+    }
+
+    #[test]
+    fn pruning_preserves_v2_reader_policy_after_coverage_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "ab".repeat(32);
+        let pairs = [
+            "runtime-english-v2",
+            "converter-inputs-v2",
+            "runtime-english-v3",
+            "converter-inputs-v3",
+        ]
+        .map(|recipe| {
+            (
+                legacy_recipe_pack(directory.path(), &source, recipe, 0, b"stale reader"),
+                legacy_recipe_pack(
+                    directory.path(),
+                    &source,
+                    recipe,
+                    BSA_READER_VERSION,
+                    b"current reader",
+                ),
+            )
+        });
+        prune_stale_reader_packs(
+            directory.path(),
+            &BTreeMap::from([(source, BSA_READER_VERSION)]),
+        )
+        .unwrap();
+        for (stale, current) in pairs {
+            assert!(!stale.exists(), "pre-reader-version v2 packs still retire");
+            assert!(
+                current.is_file(),
+                "v4 coverage does not authorize deleting current-reader packs"
+            );
+        }
     }
 
     #[test]

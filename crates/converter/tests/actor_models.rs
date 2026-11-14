@@ -1769,3 +1769,137 @@ fn referenced_npc_bases_resolve_facegen_heads() {
     );
     assert!(facegen > 0);
 }
+
+fn creature_head_slot_race(project: &str, facegen: bool) -> Vec<u8> {
+    let mut data = vec![0; 36];
+    if facegen {
+        data[32..36].copy_from_slice(&2_u32.to_le_bytes());
+    }
+    items::record(
+        b"RACE",
+        0x200,
+        &[
+            (b"EDID", items::text("SyntheticCreature")),
+            (b"WNAM", 0x300_u32.to_le_bytes().to_vec()),
+            (b"DATA", data),
+            (b"MNAM", Vec::new()),
+            (b"ANAM", items::text("Actors/Custom/skeleton.nif")),
+            (b"FNAM", Vec::new()),
+            (b"ANAM", items::text("Actors/Custom/skeleton.nif")),
+            (b"NAM3", Vec::new()),
+            (b"MNAM", Vec::new()),
+            (b"MODL", items::text(project)),
+            (b"FNAM", Vec::new()),
+            (b"MODL", items::text(project)),
+        ],
+    )
+}
+
+fn head_slot_armature(id: u32, path: &str) -> Vec<u8> {
+    let mut bod = vec![0; 12];
+    bod[..4].copy_from_slice(&1_u32.to_le_bytes());
+    items::record(
+        b"ARMA",
+        id,
+        &[
+            (b"BODT", bod),
+            (b"RNAM", 0x200_u32.to_le_bytes().to_vec()),
+            (b"MOD2", items::text(path)),
+        ],
+    )
+}
+
+#[test]
+fn creature_whole_skin_in_retail_head_slot_becomes_its_body() {
+    for female in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let records = vec![
+            items::npc(0x100, 0x200, female),
+            creature_head_slot_race("Actors/Custom/CreatureProject.hkx", false),
+            items::skin_armor(0x300, &[0x400]),
+            head_slot_armature(0x400, "Actors/Custom/whole_creature.nif"),
+        ];
+        let path = write_plugin(directory.path(), "Skyrim.esm", &records);
+        let catalog = resolve(&path);
+        let part = catalog
+            .parts
+            .iter()
+            .find(|row| row.npc_id == 0x100 && row.slot.as_str() == "body")
+            .unwrap();
+        assert_eq!(part.model_path, "Actors/Custom/whole_creature.nif");
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .find(|row| row.id == 0x100)
+                .unwrap()
+                .resolution,
+            "body"
+        );
+        let db = export(directory.path(), &path);
+        assert_eq!(
+            db.query_row(
+                "SELECT model_path FROM actor_model_parts WHERE npc_id=256 AND slot='body'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            part.model_path
+        );
+    }
+}
+
+#[test]
+fn creature_head_slot_never_displaces_a_body_or_guesses_between_models() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = || {
+        vec![
+            items::npc(0x100, 0x200, false),
+            creature_head_slot_race("Actors/Custom/CreatureProject.hkx", false),
+            items::skin_armor(0x300, &[0x400, 0x401]),
+            head_slot_armature(0x400, "Actors/Custom/head.nif"),
+        ]
+    };
+    let mut records = base();
+    records.push(items::armature(
+        0x401,
+        0x200,
+        items::BIPED_BODY,
+        Some(OTHER_BODY),
+        None,
+    ));
+    let path = write_plugin(directory.path(), "body.esm", &records);
+    assert_eq!(resolve(&path).parts[0].model_path, OTHER_BODY);
+    let mut records = base();
+    records.push(head_slot_armature(0x401, "Actors/Custom/another.nif"));
+    let path = write_plugin(directory.path(), "ambiguous.esm", &records);
+    let catalog = resolve(&path);
+    assert!(catalog.parts.is_empty());
+    assert!(
+        catalog
+            .diagnostics
+            .iter()
+            .any(|row| row.reason == UnresolvedReason::AmbiguousCreatureBody)
+    );
+}
+
+#[test]
+fn facegen_and_shared_human_projects_do_not_treat_a_head_as_a_body() {
+    let directory = tempfile::tempdir().unwrap();
+    for (project, facegen) in [
+        ("Actors/Custom/CreatureProject.hkx", true),
+        ("Actors/Character/DefaultMale.hkx", false),
+    ] {
+        let path = write_plugin(
+            directory.path(),
+            "human.esm",
+            &[
+                items::npc(0x100, 0x200, false),
+                creature_head_slot_race(project, facegen),
+                items::skin_armor(0x300, &[0x400]),
+                head_slot_armature(0x400, "Actors/Custom/head.nif"),
+            ],
+        );
+        assert!(resolve(&path).parts.is_empty());
+    }
+}

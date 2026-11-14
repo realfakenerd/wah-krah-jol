@@ -237,6 +237,25 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(any("route did not finish" in error for error in result["errors"]), result["errors"])
         self.assertIn("moving.frame_ms_p95", result["metrics"])
 
+    def test_lost_device_is_named_even_without_a_profile_bundle(self):
+        record, _ = self.fixture()
+        record.update(exit_code=ANALYSIS.EXIT_DEVICE_LOST, status="failed")
+        for name in ("streaming-frames.json", "streaming.json", "cpu-spans.json", "metadata.json"):
+            (Path(record["artifact_dir"]) / "profile" / name).unlink()
+        result = self.analyze(record)
+        self.assertTrue(result["device_lost"])
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["errors"][0], ANALYSIS.DEVICE_LOST_ERROR)
+        self.assertTrue(any("cannot read artifacts" in error for error in result["errors"]), result["errors"])
+
+    def test_other_engine_failures_are_not_reported_as_a_lost_device(self):
+        record, _ = self.fixture()
+        record.update(exit_code=1, status="failed")
+        result = self.analyze(record)
+        self.assertFalse(result["device_lost"])
+        self.assertIn("engine exit was not successful", result["errors"])
+        self.assertNotIn(ANALYSIS.DEVICE_LOST_ERROR, result["errors"])
+
     def test_truncated_rss_coverage_drops_only_memory_metrics(self):
         record, _ = self.fixture()
         self.mutate(record, "run.json", lambda r: r.update(end_monotonic=110.0))

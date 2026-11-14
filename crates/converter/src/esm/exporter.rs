@@ -306,6 +306,9 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // here, and an older-shaped `room_portals` (no `pair_index`) is migrated in place.
     crate::esm::rooms::migrate_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
+    // Typed race animation identity (db-schema.md, actor models). Archive-only snapshots keep
+    // the same schema and defer its rows like the other runtime views.
+    conn.execute_batch(crate::animation::authoring::RACE_ANIMATION_SOURCES_SQL)?;
     // Optional projection omission counters (db-schema.md section 18, #297).
     conn.execute_batch(crate::esm::projection_omissions::PROJECTION_OMISSION_TABLES_SQL)?;
     // `CREATE TABLE IF NOT EXISTS` leaves a reused older table as it was; give it the optional
@@ -531,6 +534,7 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
         DROP TABLE IF EXISTS waters;
         DROP TABLE IF EXISTS movement_game_settings;
         DROP TABLE IF EXISTS race_movement_links;
+        DROP TABLE IF EXISTS race_animation_sources;
         DROP TABLE IF EXISTS movement_types;
         DROP TABLE IF EXISTS npcs;
         DROP TABLE IF EXISTS actor_model_parts;
@@ -998,6 +1002,20 @@ fn export_records(
     // their XEMI names, and may run on a database older than `emittance_id`.
     if runtime_views && order.is_some() {
         insert_actor_models(&tx, master)?;
+        let authoring = master
+            .iter()
+            .filter(|(_, row)| &row.record_type == b"RACE" && !row.is_deleted())
+            .filter_map(|(&id, row)| {
+                crate::animation::authoring::read_race_authoring_fields(
+                    row.subrecords
+                        .iter()
+                        .map(|(tag, data)| (tag.as_slice(), data.as_slice())),
+                )
+                .ok()
+                .map(|authoring| (id, authoring))
+            })
+            .collect();
+        crate::animation::authoring::replace_race_projection(&tx, authoring)?;
         crate::esm::rooms::export_room_graph(&tx, master, &interior_cells)?;
         insert_emittance_sources(&tx, master, &mut omissions)?;
         omissions.write(&tx)?;

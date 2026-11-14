@@ -111,6 +111,7 @@ pub fn skeleton(packfile: &Packfile, at: u32) -> Result<Skeleton> {
 
 #[derive(Debug, Clone)]
 pub struct Binding {
+    pub blend_hint: u8,
     pub original_skeleton_name: String,
     pub animation: Option<u32>,
     pub transform_track_to_bone: Vec<i16>,
@@ -122,6 +123,7 @@ pub fn binding(packfile: &Packfile, at: u32) -> Result<Binding> {
     let reader = packfile.reader(at);
     let map = reader.array_bytes(32, 2)?;
     Ok(Binding {
+        blend_hint: reader.i32(64)? as u8,
         original_skeleton_name: reader.string(16)?.unwrap_or_default(),
         animation: reader.ptr(24)?,
         transform_track_to_bone: map

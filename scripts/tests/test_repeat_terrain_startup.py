@@ -225,6 +225,18 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(result["functional_checks_passed"], result["failures"])
         self.assertEqual(result["retry_accounting"]["last"]["canceled_total"], 1)
 
+    def test_lost_device_is_recorded_apart_from_other_engine_failures(self):
+        self.manifest["exit_code"] = RUNNER.EXIT_DEVICE_LOST
+        result = self.validate()
+        self.assertFalse(result["functional_checks_passed"])
+        self.assertTrue(result["device_lost"])
+        self.assertTrue(any("GPU device lost" in message for message in result["failures"]), result["failures"])
+        self.assertNotIn("engine did not complete successfully", result["failures"])
+        self.manifest["exit_code"] = 1
+        result = self.validate()
+        self.assertFalse(result["device_lost"])
+        self.assertIn("engine did not complete successfully", result["failures"])
+
     def test_missing_artifacts_and_raw_errors_fail(self):
         (self.root / "profile/metadata.json").unlink()
         (self.root / "engine.stderr.log").write_text(self.logs + "ERROR shader: Shader compilation error\n")

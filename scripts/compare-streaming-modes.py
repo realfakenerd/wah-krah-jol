@@ -105,6 +105,9 @@ MODES = {
     "adaptive64": {"jobs": 64, "activations": 32, "upload_mib": 16, "adaptive": True,
                    "backlog": 256, "memory_mib": 16384},
 }
+# Engine exit code for a lost GPU device (crates/engine/src/app.rs, EXIT_DEVICE_LOST). Such a run
+# measured nothing and is worth retrying, but repeated losses can still be the engine's fault.
+EXIT_DEVICE_LOST = 3
 EXPECTED = {"cells": 25, "models": 2029, "lod_chunks": 176, "terrain": 100, "water": 25}
 # The engine stops a route at this many real seconds, so its report and profile bundle are written
 # before the launch timeout kills the process. A hung process can still be killed before export.
@@ -227,6 +230,7 @@ def run_one(args, experiment, run, hashes):
         record["end_monotonic"] = time.monotonic()
         record["wall_seconds"] = record["end_monotonic"] - record["launch_monotonic"]
         record["input_hashes_after"] = hashes()
+        record["device_lost"] = record["exit_code"] == EXIT_DEVICE_LOST
         record["status"] = "timed_out" if record["timed_out"] else (
             "completed" if record["exit_code"] == 0 else "failed")
         write_json(directory / "run.json", record)

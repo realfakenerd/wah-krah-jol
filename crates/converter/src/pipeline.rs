@@ -1,3 +1,6 @@
+pub(crate) mod authored_actor_idle;
+mod creature_idle;
+
 use crate::{
     animation,
     archive::{
@@ -349,6 +352,10 @@ impl AssetPipeline {
         progress_tx: Sender<ProgressEvent>,
         cancellation: Cancellation,
     ) -> Result<PipelineReport, PipelineFailure> {
+        // Saved configurations cannot make current emitted bytes reuse an older script ABI.
+        config.script_abi_version = config
+            .script_abi_version
+            .max(crate::script::SCRIPT_ABI_VERSION);
         config.validate()?;
         config.freeze_schema_addons()?;
         reject_symlink_output(&config.output_dir)?;
@@ -1329,6 +1336,20 @@ impl AssetPipeline {
             stage_mo2_animation_inputs(&staging.join("vfs"), &resolved_files)?;
         }
         convert_default_animations(
+            staging,
+            &source_paths,
+            config.fail_fast,
+            &mut report,
+            &mut manifest,
+        )?;
+        authored_actor_idle::convert(
+            staging,
+            &source_paths,
+            config.fail_fast,
+            &mut report,
+            &mut manifest,
+        )?;
+        creature_idle::convert(
             staging,
             &source_paths,
             config.fail_fast,
@@ -8390,6 +8411,7 @@ mod tests {
                 );
                 assert_eq!(inputs, expected);
                 let mut clip = animation::AnimationClip {
+                    blend_hint: 0,
                     name: String::new(),
                     original_skeleton_name: "synthetic".into(),
                     duration_seconds: 1.0 / 30.0,
@@ -10286,7 +10308,7 @@ mod tests {
             b"skeleton"
         );
         assert!(
-            !vfs.join("meshes/actors/character/behaviors/0_master.hkx")
+            vfs.join("meshes/actors/character/behaviors/0_master.hkx")
                 .exists()
         );
     }
@@ -10320,7 +10342,7 @@ mod tests {
             b"clip"
         );
         assert!(
-            !vfs.join("meshes/actors/character/behaviors/0_master.hkx")
+            vfs.join("meshes/actors/character/behaviors/0_master.hkx")
                 .exists()
         );
     }

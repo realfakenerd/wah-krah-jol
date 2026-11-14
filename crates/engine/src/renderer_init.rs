@@ -2,7 +2,7 @@
 
 use bevy::{
     app::Plugin,
-    prelude::{App, Res, Startup},
+    prelude::{App, Res, Resource, Startup},
     render::{
         RenderPlugin,
         renderer::{RenderAdapterInfo, RenderDevice},
@@ -23,13 +23,18 @@ impl Plugin for RendererInitPlugin {
         app.add_systems(Startup, log_renderer_policy);
 
         #[cfg(not(target_os = "windows"))]
-        app.add_plugins(RenderPlugin {
-            render_creation: self.0.clone().into(),
-            ..Default::default()
-        });
+        {
+            let settings = settings_without_dx12(self.0.clone());
+            app.insert_resource(RequestedInstance::of(&settings));
+            app.add_plugins(RenderPlugin {
+                render_creation: settings.into(),
+                ..Default::default()
+            });
+        }
 
         #[cfg(target_os = "windows")]
         {
+            app.insert_resource(RequestedInstance::of(&self.0));
             use bevy::{
                 ecs::query::With,
                 render::settings::RenderCreation,
@@ -65,8 +70,60 @@ impl Plugin for RendererInitPlugin {
     }
 }
 
+/// The instance settings handed to wgpu, kept so the startup log can state them.
+///
+/// wgpu exposes no getter for the flags an instance was created with, so this
+/// records the request rather than reading the state back.
+#[derive(Resource, Clone, Copy)]
+struct RequestedInstance {
+    backends: Option<wgpu::Backends>,
+    flags: wgpu::InstanceFlags,
+}
+
+impl RequestedInstance {
+    fn of(settings: &WgpuSettings) -> Self {
+        Self {
+            backends: settings.backends,
+            flags: settings.instance_flags,
+        }
+    }
+}
+
+/// Removes the DX12 bit from the backend list where DX12 cannot exist.
+///
+/// Bevy keeps wgpu's indirect-call validation in release builds whenever the
+/// backend list contains `Backends::DX12`, and its default list is
+/// `Backends::all()` on every platform. Off Windows that bit can never select
+/// a backend, yet it leaves the validation on: wgpu then batches every
+/// multi-draw entry on the CPU. Bevy decides this once, inside
+/// `WgpuSettings::default()`, so changing `backends` afterwards does not move
+/// the stored flags; this redoes the same decision for the reduced list.
+/// Environment overrides keep the final say: `WGPU_BACKEND` is already part of
+/// the incoming list, and `with_env` re-applies `WGPU_VALIDATION_INDIRECT_CALL`
+/// (and the other `WGPU_*` flag variables) over the result, as Bevy does.
+#[cfg(any(not(target_os = "windows"), test))]
+fn settings_without_dx12(mut settings: WgpuSettings) -> WgpuSettings {
+    // `None` is Bevy's explicit renderer-disabled setting and stays that way.
+    settings.backends = settings
+        .backends
+        .map(|backends| backends.difference(wgpu::Backends::DX12));
+    // Debug builds keep the validation, matching Bevy's own rule.
+    #[cfg(not(debug_assertions))]
+    {
+        settings
+            .instance_flags
+            .remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        settings.instance_flags = settings.instance_flags.with_env();
+    }
+    settings
+}
+
 /// Reports the actual renderer policy once, after Bevy installs its resources.
-fn log_renderer_policy(adapter: Option<Res<RenderAdapterInfo>>, device: Option<Res<RenderDevice>>) {
+fn log_renderer_policy(
+    adapter: Option<Res<RenderAdapterInfo>>,
+    device: Option<Res<RenderDevice>>,
+    requested: Option<Res<RequestedInstance>>,
+) {
     if let (Some(adapter), Some(device)) = (adapter, device) {
         bevy::log::info!(
             "Renderer backend={:?} dx12_indirect_count_workaround={} indirect_count_enabled={}",
@@ -76,6 +133,17 @@ fn log_renderer_policy(adapter: Option<Res<RenderAdapterInfo>>, device: Option<R
                 .features()
                 .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
         );
+        if let Some(requested) = requested {
+            // The flag is requested at instance creation; wgpu has no getter
+            // to read it back from the live instance.
+            bevy::log::info!(
+                "Renderer instance requested_backends={:?} requested_validation_indirect_call={}",
+                requested.backends,
+                requested
+                    .flags
+                    .contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL),
+            );
+        }
     }
 }
 
@@ -261,8 +329,128 @@ async fn initialize_renderer(
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_features, configured_features};
-    use wgpu::{Backend, Features};
+    use super::{backend_features, configured_features, settings_without_dx12};
+    use bevy::render::settings::WgpuSettings;
+    use wgpu::{Backend, Backends, Features};
+
+    /// The default list names DX12, and the off-Windows settings must not.
+    #[test]
+    fn default_settings_lose_the_dx12_bit() {
+        let _env = env_guard();
+        let defaults = WgpuSettings::default();
+        let settings = settings_without_dx12(defaults.clone());
+        let backends = settings.backends.expect("a backend list is always set");
+        assert!(!backends.contains(Backends::DX12));
+        // Only the DX12 bit goes; the rest of the default list is kept.
+        if defaults.backends == Some(Backends::all()) {
+            assert_eq!(backends, Backends::all() & !Backends::DX12);
+        }
+    }
+
+    /// A disabled renderer stays disabled, and a user list keeps all its other bits.
+    #[test]
+    fn user_lists_lose_only_the_dx12_bit() {
+        let _env = env_guard();
+        let disabled = settings_without_dx12(WgpuSettings {
+            backends: None,
+            ..Default::default()
+        });
+        assert_eq!(disabled.backends, None);
+
+        let mixed = settings_without_dx12(WgpuSettings {
+            backends: Some(Backends::DX12 | Backends::METAL),
+            ..Default::default()
+        });
+        assert_eq!(mixed.backends, Some(Backends::METAL));
+
+        let dx12_only = settings_without_dx12(WgpuSettings {
+            backends: Some(Backends::DX12),
+            ..Default::default()
+        });
+        assert_eq!(dx12_only.backends, Some(Backends::empty()));
+
+        let untouched = settings_without_dx12(WgpuSettings {
+            backends: Some(Backends::VULKAN | Backends::METAL),
+            ..Default::default()
+        });
+        assert_eq!(untouched.backends, Some(Backends::VULKAN | Backends::METAL));
+
+        let empty = settings_without_dx12(WgpuSettings {
+            backends: Some(Backends::empty()),
+            ..Default::default()
+        });
+        assert_eq!(empty.backends, Some(Backends::empty()));
+    }
+
+    /// Serializes every test that reads or changes the process environment.
+    /// Release builds read `WGPU_VALIDATION_INDIRECT_CALL` inside
+    /// `settings_without_dx12`, so all callers of it take this lock, not only
+    /// the override tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs `body` with `WGPU_VALIDATION_INDIRECT_CALL` set to `value` (or unset), then restores it.
+    #[cfg(not(debug_assertions))]
+    fn with_indirect_validation_env(value: Option<&str>, body: impl FnOnce()) {
+        const KEY: &str = "WGPU_VALIDATION_INDIRECT_CALL";
+        let _guard = env_guard();
+        let previous = std::env::var_os(KEY);
+        // SAFETY: every test that reads or writes this variable, directly or
+        // through `WgpuSettings::default()` and `settings_without_dx12`, holds
+        // `ENV_LOCK`, so no other thread in this module touches the environment
+        // while it is changed.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var(KEY, previous),
+                None => std::env::remove_var(KEY),
+            }
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Release builds drop the indirect-call validation unless the environment asks for it.
+    /// Debug builds keep it, so this only runs under `cargo test --release`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_settings_drop_indirect_call_validation() {
+        with_indirect_validation_env(None, || {
+            let settings = settings_without_dx12(WgpuSettings::default());
+            assert!(
+                !settings
+                    .instance_flags
+                    .contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
+            );
+        });
+    }
+
+    /// `WGPU_VALIDATION_INDIRECT_CALL=1` still wins over the release-build removal.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_settings_honor_the_indirect_validation_override() {
+        with_indirect_validation_env(Some("1"), || {
+            let settings = settings_without_dx12(WgpuSettings::default());
+            assert!(
+                settings
+                    .instance_flags
+                    .contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
+            );
+        });
+    }
 
     /// DX12 loses only `MULTI_DRAW_INDIRECT_COUNT`; every other feature is kept.
     #[test]

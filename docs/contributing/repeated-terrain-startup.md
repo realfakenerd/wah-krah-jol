@@ -32,7 +32,7 @@ Each `16mib-01`, `1mib-01` and subsequent run directory contains:
 - `engine.stdout.log` and `engine.stderr.log`: complete raw launch logs.
 - `report.json`, `frames.csv` and `profile/`: the engine's acceptance and profiling outputs.
 - `frame.png`: the engine's post-warmup capture, taken after its readiness checks. It is captured once rather than at the end of the run.
-- `validation.json`: functional gates, retry accounting and failures.
+- `validation.json`: functional gates, retry accounting and failures. An engine exit code of `3` means the GPU device was lost: the run fails with `device_lost: true` and a request to retry it, rather than the generic engine failure.
 
 The manifests hash the engine, world database, cell cache, conversion manifest, integration report and LOD manifest before and after each launch. They also compare those inputs with the campaign baseline. Individual mesh and texture payload files are outside this hash scope. Pin the binary and asset directory for the campaign.
 

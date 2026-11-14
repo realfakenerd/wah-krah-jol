@@ -19,8 +19,9 @@ use gltf::json::{
     scene::UnitQuaternion,
     validation::{Checked, USize64},
 };
-use project_wormhole_nif::model::all::BoneTree;
+use project_wormhole_nif::model::all::{BoneData, BoneTransform, BoneTree};
 use project_wormhole_shared::glam;
+use project_wormhole_shared::prelude::{BSMatrix3, BSVec3};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -31,7 +32,13 @@ use std::{
 /// Clips have no source NIF at their own path, so the staging cleanups that drop
 /// outputs without a matching source must leave them alone.
 pub fn is_animation_output(relative: &str) -> bool {
-    relative.starts_with("meshes/actors/character/animations/") && relative.ends_with(".glb")
+    relative == shared::actor_idle_catalog::PATH
+        || (relative.starts_with("meshes/actor-idles/clips/") && relative.ends_with(".glb"))
+        || (relative.starts_with("meshes/actors/character/animations/")
+            && relative.ends_with(".glb"))
+        || shared::creature_idle::CREATURE_IDLES
+            .iter()
+            .any(|profile| relative == profile.clip_scene)
 }
 
 /// Writes `clip` as a GLB whose nodes are `body_bones`, binding the clip's track names first.
@@ -50,11 +57,134 @@ pub fn write_clip_glb(
     Ok(report)
 }
 
+/// Reads the skin hierarchy the runtime will actually instantiate. This avoids
+/// rebuilding a potentially different tree through a second NIF skeleton resolver.
+/// All joint ancestors must have unique names and the converter's basis wrapper.
+pub fn body_bones(scene: &Path) -> Result<BoneTree> {
+    let body = gltf::Gltf::open(scene)?;
+    let scene = body
+        .default_scene()
+        .or_else(|| body.scenes().next())
+        .ok_or_else(|| eyre!("body has no scene"))?;
+    let nodes: Vec<_> = body.nodes().collect();
+    let mut parents = BTreeMap::new();
+    for node in &nodes {
+        for child in node.children() {
+            ensure!(
+                parents.insert(child.index(), node.index()).is_none(),
+                "body node has multiple parents"
+            );
+        }
+    }
+    let roots: BTreeSet<_> = scene.nodes().map(|node| node.index()).collect();
+    let wrappers: Vec<_> = nodes
+        .iter()
+        .filter(|node| {
+            roots.contains(&node.index()) && node.name() == Some("Creation-to-glTF basis")
+        })
+        .collect();
+    ensure!(
+        wrappers.len() == 1,
+        "body requires exactly one basis wrapper at its scene root"
+    );
+    let wrapper = wrappers[0].index();
+    let mut required = BTreeSet::new();
+    let mut include = |index| -> Result<()> {
+        let mut at = index;
+        let mut visited = BTreeSet::new();
+        while at != wrapper {
+            ensure!(visited.insert(at), "body hierarchy contains a cycle");
+            required.insert(at);
+            at = *parents
+                .get(&at)
+                .ok_or_else(|| eyre!("body bone is outside its basis wrapper"))?;
+        }
+        Ok(())
+    };
+    for joint in body
+        .nodes()
+        .filter(|node| node.mesh().is_some())
+        .filter_map(|node| node.skin())
+        .flat_map(|skin| skin.joints())
+    {
+        include(joint.index())?;
+    }
+    // Unweighted attachment bones can drive rigid child meshes too. Keep their
+    // authored hierarchy without inventing joints or dropping a leaf's motion.
+    let mut pending: Vec<_> = nodes[wrapper].children().collect();
+    let mut visited = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        ensure!(
+            visited.insert(node.index()),
+            "body hierarchy contains a cycle"
+        );
+        if node.mesh().is_none() && node.name().is_some() {
+            include(node.index())?;
+        }
+        pending.extend(node.children());
+    }
+    ensure!(
+        !required.is_empty(),
+        "body has no named bones below its basis wrapper"
+    );
+    let mut tree = BoneTree::new();
+    for &index in &required {
+        let node = &nodes[index];
+        let name = node
+            .name()
+            .ok_or_else(|| eyre!("body skin ancestor has no name"))?;
+        let children = node
+            .children()
+            .filter(|child| required.contains(&child.index()))
+            .map(|child| {
+                child
+                    .name()
+                    .map(str::to_owned)
+                    .ok_or_else(|| eyre!("body skin ancestor has no name"))
+            })
+            .collect::<Result<_>>()?;
+        let (translation, rotation, scale) = node.transform().decomposed();
+        ensure!(
+            translation
+                .iter()
+                .chain(&rotation)
+                .chain(&scale)
+                .all(|value| value.is_finite()),
+            "body bone has a nonfinite transform"
+        );
+        ensure!(
+            (scale[0] - scale[1]).abs() < 1e-6 && (scale[0] - scale[2]).abs() < 1e-6,
+            "body bone has nonuniform scale"
+        );
+        let transform = BoneTransform::new(
+            Some(BSVec3(glam::Vec3::from_array(translation))),
+            Some(BSMatrix3(glam::Mat3::from_quat(glam::Quat::from_array(
+                rotation,
+            )))),
+            Some(scale[0]),
+        );
+        tree.add_bone(
+            name,
+            BoneData {
+                transform,
+                children,
+            },
+        )
+        .map_err(|message| eyre!(message))?;
+    }
+    Ok(tree)
+}
+
 fn encode_clip_glb(
     clip: &AnimationClip,
     body_bones: &BoneTree,
     clip_name: &str,
 ) -> Result<Vec<u8>> {
+    ensure!(
+        clip.blend_hint == 0,
+        "standalone GLB requires a normal clip; blend hint {} needs an explicit base pose",
+        clip.blend_hint
+    );
     ensure!(
         !body_bones.bones.is_empty(),
         "cannot write a clip without body bones"
@@ -425,6 +555,45 @@ mod tests {
 
     use crate::animation::{TransformSample, TransformTrack, decode_clip_with_skeleton};
 
+    #[test]
+    fn exported_body_skin_supplies_the_exact_clip_tree() {
+        let mut clip = fixture_clip();
+        let bones = fixture_bones();
+        bind_clip_to_bones(&mut clip, &bones.bones.keys().cloned().collect());
+        let bytes = encode_clip_glb(&clip, &bones, "idle").unwrap();
+        let parsed = gltf::Gltf::from_slice(&bytes).unwrap();
+        let mut json = serde_json::to_value(parsed.document.into_json()).unwrap();
+        json["skins"] = serde_json::json!([{"joints":[0,1,2]}]);
+        json["meshes"] = serde_json::json!([{"primitives":[{"attributes":{"POSITION":1}}]}]);
+        json["accessors"][1]["min"] = serde_json::json!([0, 0, 0]);
+        json["accessors"][1]["max"] = serde_json::json!([1, 2, 3]);
+        json["nodes"][0]["mesh"] = serde_json::json!(0);
+        json["nodes"][0]["skin"] = serde_json::json!(0);
+        let root: Root = serde_json::from_value(json).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body.glb");
+        std::fs::write(&path, pack_glb(&root, parsed.blob.unwrap()).unwrap()).unwrap();
+        assert_eq!(super::body_bones(&path).unwrap(), bones);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            super::body_bones(&path).unwrap(),
+            bones,
+            "rigid attachment trees do not require skin weights"
+        );
+    }
+
+    #[test]
+    fn additive_clips_require_a_base_pose_before_standalone_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("clip.glb");
+        std::fs::write(&output, b"keep").unwrap();
+        let mut clip = fixture_clip();
+        clip.blend_hint = 1;
+        let error = write_clip_glb(&mut clip, &fixture_bones(), "idle", &output).unwrap_err();
+        assert!(error.to_string().contains("needs an explicit base pose"));
+        assert_eq!(std::fs::read(output).unwrap(), b"keep");
+    }
+
     fn bone(transform: BoneTransform, children: &[&str]) -> BoneData {
         BoneData {
             transform,
@@ -463,6 +632,7 @@ mod tests {
 
     fn fixture_clip() -> AnimationClip {
         AnimationClip {
+            blend_hint: 0,
             name: String::new(),
             original_skeleton_name: "fixture".to_owned(),
             duration_seconds: 2.0 / 30.0,
