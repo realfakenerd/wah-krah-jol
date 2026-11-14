@@ -33,6 +33,40 @@ class InspectorTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     runtime.options(['--assets', root] + tail)
 
+    def test_offscreen_export_arguments_validate_and_forward(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = ['--assets', root, '--model', 'meshes/test.glb']
+            args = runtime.options(base + ['--export-video', '--seconds', '3', '--fps', '30',
+                                           '--size', '640x480', '--background', '#102030', '--video-format', 'mov'])
+            command = runtime.append_export_args(['inspector'], args)
+            self.assertIn('--export-video', command)
+            self.assertIn('--video-format', command)
+            self.assertEqual(command[command.index('--video-format') + 1], 'mov')
+            for tail in [
+                ['--export-video', '--background', 'transparent'],
+                ['--export-video', '--size', '641x480'],
+                ['--export-video', '--fps', '61'],
+                ['--export-gif', '--seconds', '61'],
+                ['--export-frames', '--size', '2024x2024', '--seconds', '60', '--fps', '60'],
+            ]:
+                with self.subTest(tail=tail), self.assertRaises(RuntimeError):
+                    runtime.options(base + tail)
+
+    def test_successful_export_requires_complete_manifests(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            captures = output / 'captures'
+            captures.mkdir()
+            (captures / 'manifest.json').write_text(json.dumps({'frames': [{}, {}]}))
+            with self.assertRaises(RuntimeError):
+                runtime.verify_export_success(output, 'frames', 1, 1)
+            runtime.verify_export_success(output, 'frames', 1, 2)
+            with self.assertRaises(FileNotFoundError):
+                runtime.verify_export_success(output, 'gif', 1, 2)
+            (captures / 'encoding-manifest.json').write_text(json.dumps({
+                'capture_manifest': 'manifest.json', 'requested': {'frame_count': 2}}))
+            runtime.verify_export_success(output, 'gif', 1, 2)
+
     def test_orphan_inspector_names_are_protected(self):
         for name in ['model_inspector', 'model-inspector-deadbeef', 'human_goat_lamps', 'engine', 'actor_idle_probe']:
             self.assertTrue(runtime.PROTECTED.fullmatch(name), name)

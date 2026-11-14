@@ -41,14 +41,50 @@ The richer all-pending inspection copy and its retained playtest builds remain s
 | W/S | Raise/lower the camera angle |
 | Space | Toggle ambient fill |
 | P | Pause/resume application time; camera controls remain active |
+| R | Start or stop a bounded offscreen PNG sequence |
 | F12 | Save a screenshot |
 | Esc | Close the session |
 
-The viewer frames loaded mesh bounds, reports `INSPECTOR_READY`, and requests two automatic
-captures after framing. Readiness means assets loaded and bounds were found; it is not a GPU
-qualification. Early captures can precede shader readiness. The standalone main-based build does
+R records the current fixed pose to an offscreen 640x400 PNG sequence at 30 fps, with a 120-frame
+maximum. Press R again to stop. Stop waits for any frame readback in progress, then keeps the
+captured prefix. If no frame was captured, the empty sequence is discarded. Reaching the frame
+limit also finishes the sequence. The finite `--export-*` modes below use the offscreen camera
+independently. The viewer frames loaded mesh bounds, reports
+`INSPECTOR_READY`, and requests two automatic captures after framing. Readiness means assets loaded and bounds were found; it is not a GPU
+qualification. Shader readiness remains unverified, and early captures can precede shader compilation. The standalone main-based build does
 not install the pending authored NIF UV or creature-idle playback consumers, so P does not add
 animation to a static model.
+
+## Finite offscreen exports
+
+Use one export mode. For example:
+
+```sh
+python3 -B scripts/inspect-model.py --assets /absolute/converted/assets \
+  --model meshes/clutter/example.glb --export-gif --seconds 3 --fps 30 \
+  --size 640x480 --orbit
+```
+
+`--export-frames` writes PNGs only. `--export-gif` writes an animated GIF. `--export-video` writes
+H.264 in MP4 by default; `--video-format mov` selects MOV. Exports use the offscreen camera and
+requested physical size. `--background transparent` is available for frames and GIF. Video requires
+a solid `#RRGGBB` background and even physical width and height. The encoder rejects odd sizes;
+it does not pad them.
+
+The launcher checks for at least 40 GiB free in managed storage before export and keeps that reserve
+check active through its existing whole-family watchdog. Exports are bounded to 60 seconds, 60 fps,
+3,600 frames, 4,096,000 pixels per frame and 512 MiB of PNG data. The tool preserves the PNG frames
+and `manifest.json` after encoding. The manifest records nominal rational sample times for a static
+pose and the final frame hold. `encoding-manifest.json` records computed GIF delays or the requested
+nominal video rate; it does not measure timing from the encoded file. GIF delays use cumulative
+rounding to 10 ms ticks. H.264 uses the requested constant frame rate; the container time base can
+quantize timestamps. These records do not claim bit-for-bit deterministic output.
+
+GIF encoding uses ffmpeg with `palettegen` and `paletteuse` when ffmpeg is on `PATH` or at
+`/opt/homebrew/bin/ffmpeg`. If no ffmpeg executable is available, GIF encoding uses the locked
+pure-Rust `gif` 0.13.3 crate. Video has no pure-Rust fallback and returns an explicit error if
+ffmpeg is missing. ffmpeg has a 120 second timeout, a 2 MiB log limit and owned-child termination.
+Encoding failure leaves the validated PNG sequence in place.
 
 ## Screenshots
 

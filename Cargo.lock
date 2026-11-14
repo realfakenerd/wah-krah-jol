@@ -2844,6 +2844,7 @@ dependencies = [
  "crossbeam-channel",
  "ddsfile",
  "dummy-content",
+ "gif",
  "gltf",
  "image 0.25.10",
  "image_dds 0.7.2",

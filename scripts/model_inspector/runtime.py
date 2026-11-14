@@ -49,6 +49,16 @@ def options(argv=None):
     parser.add_argument('--model', action='append', default=[])
     parser.add_argument('--record', action='append', default=[], help='hexadecimal base FormID')
     parser.add_argument('--catalog', type=Path)
+    export_modes = parser.add_mutually_exclusive_group()
+    export_modes.add_argument('--export-frames', dest='export_mode', action='store_const', const='frames')
+    export_modes.add_argument('--export-gif', dest='export_mode', action='store_const', const='gif')
+    export_modes.add_argument('--export-video', dest='export_mode', action='store_const', const='video')
+    parser.add_argument('--seconds', type=int, default=3)
+    parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--size', type=parse_size, default=(1280, 800), metavar='WIDTHxHEIGHT')
+    parser.add_argument('--orbit', action='store_true')
+    parser.add_argument('--background', default='#06080a', help='transparent or #RRGGBB')
+    parser.add_argument('--video-format', choices=('mp4', 'mov'), default='mp4')
     parser.add_argument('--build-only', action='store_true', help='build without opening a window')
     parser.add_argument('--needed-gib', type=float, default=12, help='managed build-growth estimate')
     parser.add_argument('--isolated', help='optional managed validation label')
@@ -63,7 +73,52 @@ def options(argv=None):
         need(args.catalog.is_absolute(), 'catalog must be absolute')
         args.catalog = args.catalog.resolve(strict=True)
         need(args.catalog.is_file(), 'catalog must be an existing file')
+    if args.export_mode:
+        need(0 < args.seconds <= 60, '--seconds must be between 1 and 60')
+        need(0 < args.fps <= 60, '--fps must be between 1 and 60')
+        width, height = args.size
+        pixels = width * height
+        frames = args.seconds * args.fps
+        need(width > 0 and height > 0 and pixels <= 4_096_000, '--size exceeds the 4096000-pixel export limit')
+        need(frames <= 3600 and pixels * 4 * frames <= 512 * 1024 ** 2, 'worst-case PNG staging exceeds 512 MiB')
+        need(args.background == 'transparent' or re.fullmatch(r'#[0-9a-fA-F]{6}', args.background), '--background must be transparent or #RRGGBB')
+        if args.export_mode == 'video':
+            need(args.background != 'transparent', 'video requires a solid background')
+            need(width % 2 == 0 and height % 2 == 0, 'H.264 requires even physical dimensions')
     return args
+
+
+def parse_size(value):
+    match = re.fullmatch(r'([0-9]+)x([0-9]+)', value)
+    if not match:
+        raise argparse.ArgumentTypeError('size must be WIDTHxHEIGHT')
+    return int(match.group(1)), int(match.group(2))
+
+
+def append_export_args(command, args):
+    if not args.export_mode:
+        return command
+    command.extend(['--export-' + args.export_mode, '--seconds', str(args.seconds), '--fps', str(args.fps),
+                    '--size', f'{args.size[0]}x{args.size[1]}', '--background', args.background])
+    if args.orbit:
+        command.append('--orbit')
+    if args.export_mode == 'video':
+        command.extend(['--video-format', args.video_format])
+    return command
+
+
+def verify_export_success(output, export_mode, seconds, fps):
+    """Require complete sequence evidence before accepting a successful native exit."""
+    captures = output / 'captures'
+    manifest = json.loads((captures / 'manifest.json').read_text())
+    frames = manifest.get('frames')
+    need(isinstance(frames, list) and len(frames) == seconds * fps,
+         'successful export has no complete capture manifest')
+    if export_mode in ('gif', 'video'):
+        encoded = json.loads((captures / 'encoding-manifest.json').read_text())
+        need(encoded.get('capture_manifest') == 'manifest.json'
+             and encoded.get('requested', {}).get('frame_count') == len(frames),
+             'successful encoded export has no matching encoding manifest')
 
 
 def load_workspace(repo):
@@ -204,7 +259,7 @@ def run_inside(args, repo, root, workspace):
     row = processes.processes()[os.getpid()]
     save(output / 'worker.json', dict(pid=os.getpid(), birth=row['birth']))
     need(not (output / 'stop-request.json').exists(), 'stopped before worker startup')
-    reserve = float(os.environ.get('MUDCRAB_RESERVE_GIB', workspace.RESERVE_GIB))
+    reserve = max(float(os.environ.get('MUDCRAB_RESERVE_GIB', workspace.RESERVE_GIB)), 40.0 if args.export_mode else 0.0)
     command = ['cargo', 'build', '--locked', '--profile', 'quick', '-p', 'engine',
                '--example', 'model_inspector', '-j2', '--message-format=json']
     monitor(command, repo, output, 'build.log', 'cpu', root, reserve, 3600)
@@ -234,6 +289,7 @@ def run_inside(args, repo, root, workspace):
             command += ['--record', record]
         if args.catalog:
             command += ['--catalog', str(args.catalog)]
+        append_export_args(command, args)
         # Remove unrelated engine/adapter overrides only for the native child.
         env_before = os.environ.copy()
         try:
@@ -241,7 +297,10 @@ def run_inside(args, repo, root, workspace):
                 if key.startswith(('MUDCRAB_', 'WGPU_')):
                     del os.environ[key]
             os.environ['WGPU_BACKEND'] = 'metal'
-            return monitor(command, repo, output, 'native.log', 'native', root, reserve, 1830)
+            code = monitor(command, repo, output, 'native.log', 'native', root, reserve, 1830)
+            if code == 0 and args.export_mode:
+                verify_export_success(output, args.export_mode, args.seconds, args.fps)
+            return code
         finally:
             os.environ.clear()
             os.environ.update(env_before)
@@ -267,6 +326,8 @@ def main(argv=None):
     workspace, root, tool = load_workspace(repo)
     if args.inside:
         return run_inside(args, repo, root, workspace)
+    if args.export_mode:
+        need(root.is_dir() and shutil.disk_usage(root).free >= 40 * GIB, '40 GiB managed-storage reserve unavailable for export')
     workspace.Workspace(repo).setup()
     need(len(held_build_leases(root)) < 2, 'two managed commands are already active')
     if not args.build_only:
@@ -276,7 +337,7 @@ def main(argv=None):
     sample_host(profile='cpu', admission=True)
     output = create_output(root)
     save(output / 'launch.json', dict(workspace_tool=str(tool), workspace_sha256=workspace.inspector_source_sha256,
-         assets=str(args.assets), models=args.model, records=args.record,
+         assets=str(args.assets), models=args.model, records=args.record, export=args.export_mode, seconds=args.seconds, fps=args.fps, size=args.size,
          scope='standalone model inspection; no world or feature acceptance'))
     command = [sys.executable, '-B', str(repo / 'scripts/inspect-model.py'), '--inside',
                '--run-dir', str(output), '--assets', str(args.assets)]
@@ -286,6 +347,7 @@ def main(argv=None):
         command += ['--record', record]
     if args.catalog:
         command += ['--catalog', str(args.catalog)]
+    append_export_args(command, args)
     if args.build_only:
         command += ['--build-only']
     class CapacityBound(workspace.Workspace):
@@ -293,6 +355,9 @@ def main(argv=None):
             # Workspace.run_task calls this while holding allocation.lock. Keep that
             # implementation unchanged and make the global two-command check atomic.
             need(len(held_build_leases(self.root)) < 2, 'two managed commands are active')
+            if args.export_mode:
+                need(shutil.disk_usage(self.root).free >= (40 + needed_gib) * GIB,
+                     '40 GiB export reserve plus managed growth estimate unavailable')
             return super().preflight(needed_gib, output)
     with forwarding.ForwardSignals(output):
         code = CapacityBound(repo).run_task(command, args.isolated, args.needed_gib)
