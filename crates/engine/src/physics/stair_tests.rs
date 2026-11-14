@@ -115,6 +115,273 @@ fn narrow_stair_flights_walk_run_oblique_and_descend() {
 }
 
 #[test]
+fn camera_presentation_tracks_production_stair_flight_without_changing_body_motion() {
+    let mut app = headless::fixture_app();
+    for index in 0..32 {
+        let top = (index + 1) as f32 * 12.0;
+        fixed_box(
+            &mut app,
+            Vec3::new(index as f32 * 24.0 + 12.0, top * 0.5, 850.0),
+            Vec3::new(12.0, top * 0.5, 700.0),
+        );
+    }
+    fixed_box(
+        &mut app,
+        Vec3::new(1026.0, 192.0, 850.0),
+        Vec3::new(258.0, 192.0, 700.0),
+    );
+    let start = settle(&mut app, Vec3::new(-100.0, 200.0, 850.0));
+    let tuning = MovementTuning::default();
+    let body = {
+        let mut query = app.world_mut().query_filtered::<Entity, With<PlayerBody>>();
+        query.single(app.world()).unwrap()
+    };
+    let camera = {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StreamingCamera>>();
+        query.single(app.world()).unwrap()
+    };
+    app.world_mut()
+        .get_mut::<Transform>(camera)
+        .unwrap()
+        .translation = start + Vec3::Y * tuning.eye_height;
+    app.update();
+
+    app.insert_resource(WalkIntent {
+        wish_dir: Vec3::X,
+        target_speed: 370.0,
+        jump_pressed: false,
+    });
+    app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+        std::time::Duration::from_secs_f32(1.0 / 60.0),
+    ));
+    let mut previous_camera_y = app.world().get::<Transform>(camera).unwrap().translation.y;
+    let mut largest_rise = 0.0_f32;
+    let mut moved_up = false;
+    for _ in 0..900 {
+        let previous_body = app.world().get::<Transform>(body).unwrap().translation;
+        app.update();
+        let body_pose = app.world().get::<Transform>(body).unwrap().translation;
+        let camera_y = app.world().get::<Transform>(camera).unwrap().translation.y;
+        let offset = app.world().resource::<WalkCameraFollowState>().offset_y;
+        assert!(
+            (camera_y - (body_pose.y + tuning.eye_height - offset)).abs() < 1.0e-3,
+            "camera transform did not apply the accumulated presentation offset"
+        );
+        let rise = body_pose.y - previous_body.y;
+        if rise > 10.0 {
+            let tick = app.world().resource::<WalkCameraTick>();
+            assert!(
+                tick.last_sample_validated_rise && tick.last_sample_collected_y > 0.0,
+                "physical stair rise lacked the fixed-tick validated marker: rise={rise}, marker={}, collected_y={}",
+                tick.last_sample_validated_rise,
+                tick.last_sample_collected_y
+            );
+            moved_up = true;
+            largest_rise = largest_rise.max(rise);
+            assert!(
+                camera_y - previous_camera_y < rise,
+                "camera followed a physical stair rise instantly: body rise={rise}, camera rise={}",
+                camera_y - previous_camera_y
+            );
+        }
+        previous_camera_y = camera_y;
+        if body_pose.x >= 820.0 {
+            break;
+        }
+    }
+    app.insert_resource(WalkIntent::default());
+    let offset_before_settle = app.world().resource::<WalkCameraFollowState>().offset_y;
+    for _ in 0..30 {
+        app.update();
+    }
+    let top = app.world().get::<Transform>(body).unwrap().translation;
+    assert!(
+        moved_up && largest_rise > 1.0,
+        "production controller produced no stair rises"
+    );
+    assert!(
+        (top.y - start.y - 384.0).abs() < 3.0,
+        "camera work changed the physical stair endpoint: {start:?} -> {top:?}"
+    );
+    let settled_camera_y = app.world().get::<Transform>(camera).unwrap().translation.y;
+    let expected_offset =
+        offset_before_settle * (-(30.0 / 60.0) / WALK_STEP_CAMERA_RESPONSE_SECONDS).exp();
+    let actual_offset = app.world().resource::<WalkCameraFollowState>().offset_y;
+    assert!(
+        (actual_offset - expected_offset).abs() < 1.0e-3,
+        "offset recurrence mismatch: expected {expected_offset}, got {actual_offset}"
+    );
+    assert!((settled_camera_y - (top.y + tuning.eye_height - expected_offset)).abs() < 1.0e-3);
+
+    // Three fixed ticks per rendered frame tests the accumulated-delta path.
+    app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+        std::time::Duration::from_secs_f32(1.0 / 20.0),
+    ));
+    app.insert_resource(WalkIntent {
+        wish_dir: -Vec3::X,
+        target_speed: 370.0,
+        jump_pressed: false,
+    });
+    let mut previous_camera_y = settled_camera_y;
+    let mut descended = false;
+    let mut smoothed_descent = false;
+    for _ in 0..300 {
+        let previous_body_y = app.world().get::<Transform>(body).unwrap().translation.y;
+        app.update();
+        let body_pose = app.world().get::<Transform>(body).unwrap().translation;
+        let camera_y = app.world().get::<Transform>(camera).unwrap().translation.y;
+        let offset = app.world().resource::<WalkCameraFollowState>().offset_y;
+        assert!(
+            (camera_y - (body_pose.y + tuning.eye_height - offset)).abs() < 1.0e-3,
+            "camera transform did not apply the accumulated presentation offset"
+        );
+        if body_pose.y < previous_body_y - 6.0 {
+            descended = true;
+            // Catching up from an earlier step can exceed this frame's body motion.
+            // The response must stay between its previous eye and current target.
+            let target_y = body_pose.y + tuning.eye_height;
+            assert!(
+                camera_y >= target_y.min(previous_camera_y) - 1.0e-3
+                    && camera_y <= target_y.max(previous_camera_y) + 1.0e-3,
+                "descent camera overshot its target: previous={previous_camera_y}, target={target_y}, actual={camera_y}"
+            );
+            if app
+                .world()
+                .resource::<WalkCameraTick>()
+                .last_sample_collected_y
+                < -1.0
+            {
+                assert!(
+                    camera_y > target_y + 1.0e-3,
+                    "a supported downward snap moved the view to its target instantly"
+                );
+                smoothed_descent = true;
+            }
+        }
+        previous_camera_y = camera_y;
+        if body_pose.x <= -100.0 {
+            break;
+        }
+    }
+    assert!(
+        descended,
+        "production controller produced no supported stair descent"
+    );
+    assert!(
+        smoothed_descent,
+        "the fixture never exercised a smoothed supported downward snap"
+    );
+    app.insert_resource(WalkIntent::default());
+    for _ in 0..30 {
+        app.update();
+    }
+    let bottom = app.world().get::<Transform>(body).unwrap().translation;
+    assert!(
+        (bottom.y - start.y).abs() < 3.0,
+        "camera work changed the physical return endpoint: {start:?} -> {bottom:?}"
+    );
+}
+
+/// A fixed slab whose top surface starts at `(0, top_y)` and descends toward +X at `degrees`.
+fn fixed_descending_ramp(app: &mut App, degrees: f32, length: f32, top_y: f32) {
+    let angle = degrees.to_radians();
+    let half_thickness = 20.0;
+    let normal = Vec3::new(angle.sin(), angle.cos(), 0.0);
+    let middle =
+        Vec3::new(0.0, top_y, 850.0) + Vec3::new(angle.cos(), -angle.sin(), 0.0) * (length * 0.5);
+    app.world_mut().spawn((
+        RigidBody::Fixed,
+        Collider::cuboid(length * 0.5, half_thickness, 700.0),
+        world_collision_groups(),
+        Transform::from_translation(middle - normal * half_thickness)
+            .with_rotation(Quat::from_rotation_z(-angle)),
+    ));
+}
+
+/// Walking down a walkable ramp or hill is continuous ground contact. The eye must stay at its
+/// normal height above the body on every frame, not float above it as it would for a stair drop.
+#[test]
+fn camera_follows_the_body_directly_down_walkable_slopes() {
+    for (degrees, speed) in [
+        (10.0_f32, 370.0),
+        (20.0, 370.0),
+        (35.0, 370.0),
+        (20.0, 80.1),
+    ] {
+        let mut app = headless::fixture_app();
+        let length = 1_400.0;
+        fixed_descending_ramp(&mut app, degrees, length, 700.0);
+        let surface = |x: f32| 700.0 - x * degrees.to_radians().tan();
+        let start_x = 40.0;
+        let start = settle(&mut app, Vec3::new(start_x, surface(start_x) + 60.0, 850.0));
+        let tuning = MovementTuning::default();
+        let camera = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<StreamingCamera>>();
+            query.single(app.world()).unwrap()
+        };
+        app.world_mut()
+            .get_mut::<Transform>(camera)
+            .unwrap()
+            .translation = start + Vec3::Y * tuning.eye_height;
+        app.update();
+        app.insert_resource(WalkIntent {
+            wish_dir: Vec3::X,
+            target_speed: speed,
+            jump_pressed: false,
+        });
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f32(1.0 / 60.0),
+        ));
+        let end_x = length * degrees.to_radians().cos() * 0.8;
+        let mut frames = 0;
+        let mut grounded_frames = 0;
+        let mut lowest = start.y;
+        for _ in 0..2_000 {
+            app.update();
+            frames += 1;
+            let (body, grounded) = headless::player_pose(&mut app);
+            grounded_frames += u32::from(grounded);
+            let camera_y = app.world().get::<Transform>(camera).unwrap().translation.y;
+            let follow = app.world().resource::<WalkCameraFollowState>();
+            let tick = app.world().resource::<WalkCameraTick>();
+            assert_eq!(
+                tick.last_sample_collected_y, 0.0,
+                "{degrees} deg at {speed} u/s: a ramp tick was collected as a stair drop at {body:?}"
+            );
+            assert!(
+                follow.offset_y.abs() < 1.0e-3
+                    && (camera_y - (body.y + tuning.eye_height)).abs() < 1.0e-3,
+                "{degrees} deg at {speed} u/s: the view floats {:.2} u above its eye target at {body:?}",
+                camera_y - (body.y + tuning.eye_height)
+            );
+            lowest = lowest.min(body.y);
+            if body.x >= end_x {
+                break;
+            }
+        }
+        // Controls: the walk really went downhill and reached the far part of the ramp, and the
+        // body spent most frames on the ground (an airborne frame resets the offset by itself).
+        assert!(
+            grounded_frames * 2 > frames,
+            "{degrees} deg at {speed} u/s: only {grounded_frames}/{frames} grounded frames"
+        );
+        let end = headless::player_pose(&mut app).0;
+        assert!(
+            end.x >= end_x,
+            "{degrees} deg at {speed} u/s stalled at {end:?} after {frames}"
+        );
+        assert!(
+            start.y - lowest > 100.0,
+            "{degrees} deg at {speed} u/s: the fixture did not descend ({start:?} -> {lowest})"
+        );
+    }
+}
+
+#[test]
 fn stairs_keep_rise_and_overhead_clearance_limits() {
     for (rise, ceiling) in [(48.0, false), (24.0, true)] {
         let mut app = headless::fixture_app();

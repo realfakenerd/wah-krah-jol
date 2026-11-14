@@ -552,6 +552,8 @@ impl Plugin for PlayerControlsPlugin {
             .init_resource::<LookIntent>()
             .init_resource::<WalkEntryStatus>()
             .init_resource::<WalkSpawnHold>()
+            .init_resource::<WalkCameraFollowState>()
+            .init_resource::<WalkCameraTick>()
             .init_resource::<CursorCapture>()
             .add_message::<TeleportPlayer>()
             .add_console_command(toggle_collision_command())
@@ -582,6 +584,10 @@ impl Plugin for PlayerControlsPlugin {
                     .run_if(crate::door_crossing::walk_physics_allowed)
                     .run_if(console_closed)
                     .before(PhysicsSet::SyncBackend),
+            )
+            .add_systems(
+                FixedUpdate,
+                sample_walk_camera_tick.after(PhysicsSet::Writeback),
             );
     }
 }
@@ -1738,6 +1744,7 @@ pub fn walk_movement_system(
     mut intent: ResMut<WalkIntent>,
     tuning: Res<MovementTuning>,
     context: ReadRapierContext,
+    mut camera_tick: Option<ResMut<WalkCameraTick>>,
     mut player: WalkBodyQuery,
 ) {
     if *mode != MoveMode::Walk {
@@ -1774,6 +1781,9 @@ pub fn walk_movement_system(
             displacement.reject_from_normalized(Vec3::Y),
         )
     {
+        if let Some(tick) = camera_tick.as_deref_mut() {
+            tick.validated_rise = true;
+        }
         // The upward sweep validated this segment. Rapier runs the controller
         // before syncing transforms, so override this tick's query pose too.
         // Do not subtract the lift from the horizontal tick: built-in autostep
@@ -1912,22 +1922,382 @@ fn walk_step_rise(
 }
 
 /// Camera follows the capsule at eye height; yaw on body, pitch on view (V9).
-pub fn walk_camera_follow_system(
+/// This response is Mudcrab presentation tuning. It is not a native Skyrim measurement.
+const WALK_STEP_CAMERA_RESPONSE_SECONDS: f32 = 0.055;
+const WALK_STEP_CAMERA_MAX_TICK_DELTA: f32 = 36.0;
+const WALK_STEP_CAMERA_MIN_TICK_DELTA: f32 = 1.0;
+
+#[derive(Debug, Default, Resource)]
+pub struct WalkCameraTick {
+    previous_body: Option<Vec3>,
+    previous_supported: bool,
+    validated_rise: bool,
+    pending_y: f32,
+    discontinuity: bool,
+    airborne: bool,
+    #[cfg(test)]
+    last_sample_validated_rise: bool,
+    #[cfg(test)]
+    last_sample_collected_y: f32,
+}
+
+#[derive(Debug, Default, Resource)]
+struct WalkCameraFollowState {
+    offset_y: f32,
+    initialized: bool,
+    previous_origin: Option<IVec2>,
+}
+
+/// The steepest ground, in degrees, whose per-tick lowering the view follows directly.
+/// Mudcrab presentation tuning, not a native Skyrim value. The controller itself climbs slopes up
+/// to `slope_climb_degrees` (50); this is lower on purpose, because a stair flight descended at a
+/// run slides over each edge and its per-tick lowering looks like a 25 to 45 degree slope.
+const WALK_STEP_CAMERA_SLOPE_DEGREES: f32 = 30.0;
+
+/// Whether one fixed tick's supported downward move is a stair drop rather than ordinary ground.
+///
+/// Walking down a ramp or hill lowers the body by `horizontal travel * tan(slope)` every tick.
+/// That is continuous ground contact, so the eye follows it directly. A tick counts as a stair
+/// drop only when the body lowers by more than that allowance for the tick's horizontal travel,
+/// plus [`WALK_STEP_CAMERA_MIN_TICK_DELTA`] of slack for ground-snap jitter. A drop with no
+/// horizontal travel (a lift or an edge) counts too. Ground steeper than the allowance, which is
+/// rare, is smoothed like stairs.
+fn is_stair_drop(tick_delta: Vec3, tuning: &MovementTuning) -> bool {
+    let slope = WALK_STEP_CAMERA_SLOPE_DEGREES
+        .min(tuning.slope_climb_degrees)
+        .to_radians();
+    let slope_allowance = tick_delta.xz().length() * slope.tan();
+    -tick_delta.y > slope_allowance + WALK_STEP_CAMERA_MIN_TICK_DELTA
+}
+
+fn accumulate_camera_offset(offset: f32, delta_y: f32) -> f32 {
+    // Keep the presented height continuous when step direction reverses.
+    // Only explicit placement/reset paths discard the residual.
+    offset + delta_y
+}
+
+fn exponential_camera_offset(offset: f32, delta_secs: f32) -> f32 {
+    if !delta_secs.is_finite() || delta_secs <= 0.0 {
+        return offset;
+    }
+    offset * (-delta_secs / WALK_STEP_CAMERA_RESPONSE_SECONDS).exp()
+}
+
+/// Runs after Rapier writeback so this records the controller's final physical pose per tick.
+fn sample_walk_camera_tick(
+    mode: Res<MoveMode>,
+    tuning: Res<MovementTuning>,
+    mut tick: ResMut<WalkCameraTick>,
+    player: Query<
+        (
+            &Transform,
+            &WalkState,
+            Option<&KinematicCharacterControllerOutput>,
+        ),
+        With<PlayerBody>,
+    >,
+) {
+    let Ok((body, walk, output)) = player.single() else {
+        tick.previous_body = None;
+        tick.previous_supported = false;
+        tick.pending_y = 0.0;
+        tick.validated_rise = false;
+        tick.discontinuity = false;
+        tick.airborne = false;
+        return;
+    };
+    if *mode != MoveMode::Walk {
+        tick.previous_body = Some(body.translation);
+        tick.previous_supported = false;
+        tick.pending_y = 0.0;
+        tick.validated_rise = false;
+        tick.airborne = false;
+        return;
+    }
+
+    let supported = output.is_some_and(|result| result.grounded);
+    let jumping_or_falling = walk.jump_active || (!supported && walk.vertical_velocity.abs() > 2.0);
+    #[cfg(test)]
+    {
+        tick.last_sample_validated_rise = tick.validated_rise;
+        tick.last_sample_collected_y = 0.0;
+    }
+    if let Some(previous) = tick.previous_body {
+        let delta = body.translation - previous;
+        let bounded = delta.y.abs() <= WALK_STEP_CAMERA_MAX_TICK_DELTA;
+        if delta.xz().length() > 256.0 || !bounded {
+            tick.discontinuity = true;
+            tick.pending_y = 0.0;
+        } else if tick.validated_rise && delta.y > 0.0 {
+            // The explicit sweep signal remains valid when movement clears grounded.
+            tick.pending_y += delta.y;
+            #[cfg(test)]
+            {
+                tick.last_sample_collected_y = delta.y;
+            }
+        } else if tick.previous_supported
+            && supported
+            && !jumping_or_falling
+            && !walk.jump_active
+            && is_stair_drop(delta, &tuning)
+        {
+            // Smooth only bounded supported drops that a walkable slope cannot explain.
+            // Walking down a ramp or hill is continuous contact and stays direct.
+            tick.pending_y += delta.y;
+            #[cfg(test)]
+            {
+                tick.last_sample_collected_y = delta.y;
+            }
+        }
+        if jumping_or_falling || (!supported && !tick.validated_rise) {
+            // Keep this state sticky until render consumes it. A jump and landing can
+            // both occur between two rendered frames.
+            tick.airborne = true;
+            tick.pending_y = 0.0;
+        }
+    }
+    tick.previous_body = Some(body.translation);
+    tick.previous_supported = supported;
+    tick.validated_rise = false;
+}
+
+type WalkCameraFollowPlayerQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Transform, &'static WalkState),
+    (With<PlayerBody>, Without<StreamingCamera>),
+>;
+
+#[allow(clippy::too_many_arguments)]
+fn walk_camera_follow_system(
     mode: Res<MoveMode>,
     tuning: Res<MovementTuning>,
     look: Res<LookIntent>,
-    player: Query<&Transform, (With<PlayerBody>, Without<StreamingCamera>)>,
+    time: Res<Time>,
+    camera_space: Option<Res<crate::sky::CameraSpace>>,
+    render_origin: Option<Res<crate::streaming::RenderOrigin>>,
+    mut teleports: MessageReader<TeleportPlayer>,
+    mut tick: Option<ResMut<WalkCameraTick>>,
+    mut follow: ResMut<WalkCameraFollowState>,
+    player: WalkCameraFollowPlayerQuery,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
 ) {
+    let mut teleported = false;
+    for _ in teleports.read() {
+        teleported = true;
+    }
+    let space_changed = camera_space
+        .as_ref()
+        .is_some_and(|space| space.is_changed());
+    let current_origin = render_origin.as_ref().map(|origin| origin.0);
+    let origin_changed = follow
+        .previous_origin
+        .is_some_and(|old| Some(old) != current_origin);
+    follow.previous_origin = current_origin;
+
     if *mode != MoveMode::Walk {
+        if mode.is_changed() || teleported || space_changed || origin_changed {
+            follow.offset_y = 0.0;
+            if let Some(tick) = tick.as_deref_mut() {
+                tick.pending_y = 0.0;
+                tick.discontinuity = false;
+            }
+        }
         return;
     }
-    let (Ok(body), Ok(mut view)) = (player.single(), camera.single_mut()) else {
+    let (Ok((body, walk)), Ok(mut view)) = (player.single(), camera.single_mut()) else {
         return;
     };
+    let target = body.translation + Vec3::Y * tuning.eye_height;
+    if !follow.initialized {
+        // The authored startup camera pose is authoritative for the first frame.
+        follow.initialized = true;
+        if let Some(tick) = tick.as_deref_mut() {
+            tick.pending_y = 0.0;
+            tick.discontinuity = false;
+        }
+        set_walk_camera_rotation(&mut view, body, look.pitch);
+        return;
+    }
+
+    let reset = mode.is_changed() || teleported || space_changed || origin_changed;
+    let camera_tick = tick.as_deref_mut();
+    let discontinuity = camera_tick.as_ref().is_some_and(|tick| tick.discontinuity);
+    let airborne = camera_tick.as_ref().is_some_and(|tick| tick.airborne) || walk.jump_active;
+    if reset || discontinuity || airborne {
+        view.translation = target;
+        follow.offset_y = 0.0;
+    } else {
+        let pending = camera_tick.as_ref().map_or(0.0, |tick| tick.pending_y);
+        follow.offset_y = accumulate_camera_offset(follow.offset_y, pending);
+        if let Some(tick) = tick.as_deref_mut() {
+            tick.pending_y = 0.0;
+            tick.discontinuity = false;
+        }
+        follow.offset_y = exponential_camera_offset(follow.offset_y, time.delta_secs());
+        view.translation = target - Vec3::Y * follow.offset_y;
+    }
+    if let Some(tick) = tick.as_deref_mut()
+        && (reset || discontinuity || airborne)
+    {
+        tick.pending_y = 0.0;
+        tick.discontinuity = false;
+        tick.airborne = false;
+        tick.previous_body = Some(body.translation);
+    }
+    set_walk_camera_rotation(&mut view, body, look.pitch);
+}
+
+fn set_walk_camera_rotation(view: &mut Transform, body: &Transform, pitch: f32) {
     let (yaw, _, _) = body.rotation.to_euler(EulerRot::YXZ);
-    view.translation = body.translation + Vec3::Y * tuning.eye_height;
-    view.rotation = Quat::from_euler(EulerRot::YXZ, yaw, look.pitch, 0.0);
+    view.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+}
+
+#[cfg(test)]
+mod walk_camera_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn accumulated_step_offset_follows_the_exponential_recurrence() {
+        let rise = 24.0_f32;
+        let dt = 1.0 / 60.0;
+        let decay = (-dt / WALK_STEP_CAMERA_RESPONSE_SECONDS).exp();
+        let expected_offset = rise * decay;
+        let offset = exponential_camera_offset(rise, dt);
+        assert!((offset - expected_offset).abs() < 1.0e-5);
+        assert_eq!(accumulate_camera_offset(5.0, -2.0), 3.0);
+        assert_eq!(accumulate_camera_offset(-5.0, 2.0), -3.0);
+        assert_eq!(accumulate_camera_offset(5.0, 2.0), 7.0);
+        assert!((rise - offset) < rise);
+        assert!(exponential_camera_offset(offset, dt) < offset);
+
+        let slow_dt = 1.0 / 20.0;
+        let after_three_ticks = rise * (-3.0 * dt / WALK_STEP_CAMERA_RESPONSE_SECONDS).exp();
+        let accumulated_then_decayed = exponential_camera_offset(rise * 3.0, slow_dt);
+        assert!((accumulated_then_decayed - 3.0 * after_three_ticks).abs() < 1.0e-5);
+        let old_target = 100.0;
+        let old_offset = 5.0;
+        let reverse_step = -2.0;
+        assert_eq!(
+            old_target - old_offset,
+            old_target + reverse_step - accumulate_camera_offset(old_offset, reverse_step),
+            "step collection must not itself move the presented eye"
+        );
+    }
+
+    /// Per-tick classification: ordinary ground is not a stair drop, a riser is.
+    #[test]
+    fn stair_drop_classification_separates_slopes_from_risers() {
+        let tuning = MovementTuning::default();
+        let tick = 1.0 / 60.0;
+        let drop = |horizontal: f32, down: f32| Vec3::new(horizontal, -down, 0.0);
+        for speed in [80.1_f32, 370.0] {
+            let travel = speed * tick;
+            // Ordinary ramps and hills, up to the allowance, at walking and running speed.
+            for degrees in [5.0_f32, 10.0, 20.0, 29.0] {
+                let down = travel * degrees.to_radians().tan();
+                assert!(
+                    !is_stair_drop(drop(travel, down), &tuning),
+                    "{degrees} degree slope at {speed} u/s was read as a stair drop"
+                );
+            }
+            // Stair risers lower the body by far more than the slope allowance for that travel.
+            for riser in [12.0_f32, 24.0] {
+                assert!(
+                    is_stair_drop(drop(travel, riser), &tuning),
+                    "{riser}-unit riser at {speed} u/s was not read as a stair drop"
+                );
+            }
+        }
+        // The slack covers ground-snap jitter; a drop in place beyond it is still a drop.
+        assert!(!is_stair_drop(drop(0.0, 0.9), &tuning));
+        assert!(is_stair_drop(drop(0.0, 1.5), &tuning));
+        // Only lowering matters: a rise or a level move is never a drop.
+        assert!(!is_stair_drop(drop(6.0, -10.0), &tuning));
+        assert!(!is_stair_drop(drop(6.0, 0.0), &tuning));
+        // A controller with a gentler climb limit lowers the allowance with it.
+        let gentle = MovementTuning {
+            slope_climb_degrees: 15.0,
+            ..MovementTuning::default()
+        };
+        let down = 6.17 * 28.0_f32.to_radians().tan();
+        assert!(!is_stair_drop(drop(6.17, down), &tuning));
+        assert!(is_stair_drop(drop(6.17, down), &gentle));
+    }
+
+    #[test]
+    fn camera_placement_resets_clear_pending_steps_and_follow_full_position() {
+        let mut app = headless::fixture_app();
+        let (body, camera) = {
+            let mut bodies = app.world_mut().query_filtered::<Entity, With<PlayerBody>>();
+            let body = bodies.single(app.world()).unwrap();
+            let mut cameras = app
+                .world_mut()
+                .query_filtered::<Entity, With<StreamingCamera>>();
+            (body, cameras.single(app.world()).unwrap())
+        };
+        app.insert_resource(MoveMode::Walk);
+        app.world_mut().run_schedule(Update);
+        for case in 0..5 {
+            {
+                let mut follow = app.world_mut().resource_mut::<WalkCameraFollowState>();
+                follow.initialized = true;
+                follow.offset_y = 12.0;
+            }
+            app.world_mut().resource_mut::<WalkCameraTick>().pending_y = 24.0;
+            let destination = Vec3::new(500.0 + case as f32 * 100.0, 800.0, -900.0);
+            app.world_mut()
+                .get_mut::<Transform>(body)
+                .unwrap()
+                .translation = destination;
+            match case {
+                0 => {
+                    app.world_mut().write_message(TeleportPlayer {
+                        position: destination,
+                        sampled_ground_y: Some(destination.y),
+                        yaw: 0.4,
+                    });
+                }
+                1 => {
+                    app.insert_resource(crate::sky::CameraSpace::Interior);
+                }
+                2 => {
+                    app.insert_resource(MoveMode::Noclip);
+                    app.world_mut().run_schedule(Update);
+                    app.insert_resource(MoveMode::Walk);
+                }
+                3 => {
+                    app.insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO));
+                    app.world_mut().run_schedule(Update);
+                    app.world_mut()
+                        .resource_mut::<WalkCameraFollowState>()
+                        .offset_y = 12.0;
+                    app.world_mut().resource_mut::<WalkCameraTick>().pending_y = 24.0;
+                    app.world_mut()
+                        .resource_mut::<crate::streaming::RenderOrigin>()
+                        .0 = IVec2::X;
+                }
+                _ => {
+                    app.world_mut()
+                        .get_mut::<WalkState>(body)
+                        .unwrap()
+                        .jump_active = true;
+                }
+            }
+            app.world_mut().run_schedule(Update);
+            let position = app.world().get::<Transform>(body).unwrap().translation;
+            let view = app.world().get::<Transform>(camera).unwrap().translation;
+            assert!(
+                view.distance(position + Vec3::Y * MovementTuning::default().eye_height) < 1.0e-3,
+                "reset case {case} retained an old camera coordinate: {view:?} vs {position:?}"
+            );
+            assert_eq!(
+                app.world().resource::<WalkCameraFollowState>().offset_y,
+                0.0
+            );
+            assert_eq!(app.world().resource::<WalkCameraTick>().pending_y, 0.0);
+        }
+    }
 }
 
 /// Attempt NOCLIP->WALK at the camera pose; overlap pushes the search upward
