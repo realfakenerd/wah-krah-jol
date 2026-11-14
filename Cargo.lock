@@ -2851,6 +2851,8 @@ dependencies = [
  "memmap2",
  "mlua",
  "naga_oil",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
  "regex",
  "rkyv",
  "rusqlite",

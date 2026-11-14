@@ -72,8 +72,8 @@ samply record --save-only --unstable-presymbolicate --rate 1000 \
 
 This launches the ordinary game, including its default NOCLIP player mode. Let asset loading and
 pipeline compilation settle, record at least a minute of steady rendering, then close the game.
-Record the warmup and steady-range boundaries. Keep the window visible: macOS can return an occluded
-surface and skip rendering while update loops continue. A high update FPS from that state is invalid
+Record the warmup and steady-range boundaries. Keep the window visible (`perf.py run --window background` keeps it under other windows without taking focus): macOS can return an occluded
+surface and skip rendering while update loops continue; a hidden window never acquires a drawable at all. A high update FPS from that state is invalid
 rendering evidence. Verify scene content as well as successful drawable acquisition.
 
 Do not use `--main-thread-only`: render-thread work and task-pool drawable acquisition matter here.
@@ -215,3 +215,7 @@ reason to refresh every mesh on every frame.
 
 For repeated camera, queue and coverage requirements, see the
 [matched batching protocol](../research/terrain-batching-matched-protocol-20261009.md).
+
+To compare two binaries or two sets of screenshots without a person watching, see the [performance loop](perf-loop.md). It also
+runs Samply and the Metal trace for you (`perf.py run --profiler samply|metal-trace`) and reads their output
+(`perf.py samply-top`, `perf.py gpu-busy`, `perf.py summarize`); see "Analysing a run" there.

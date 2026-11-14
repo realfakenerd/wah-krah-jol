@@ -1,0 +1,72 @@
+{
+  "description": "Scenarios for scripts/perf/perf.py. Flags and grids are those of scripts/phase2-baseline.ps1 and scripts/phase2-profile.ps1; the harness adds the benchmark, profile and acceptance flags itself.",
+  "scenarios": {
+    "synthetic": {
+      "description": "250,000 synthetic instances; needs no converted data",
+      "needs_assets": false,
+      "warmup_frames": 120,
+      "args": ["--benchmark-only", "--synthetic-instances", "250000"]
+    },
+    "terrain-water": {
+      "description": "terrain and water fixture scene; needs no converted data",
+      "needs_assets": false,
+      "warmup_frames": 120,
+      "args": ["--terrain-water-fixture"]
+    },
+    "rural": {
+      "description": "Tamriel grid 0,0 standing still",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "0", "--grid-y", "0"]
+    },
+    "dense": {
+      "description": "Riverwood, Tamriel grid 3,-12 standing still (about 2,900 references within two cells)",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "3", "--grid-y", "-12"]
+    },
+    "dense-legacy": {
+      "description": "the former dense place, Tamriel grid 18,-5 (about 1,530 references)",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "18", "--grid-y", "-5"]
+    },
+    "water": {
+      "description": "Tamriel grid 7,-2 standing still",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "7", "--grid-y", "-2"]
+    },
+    "stress": {
+      "description": "streaming stress: stream radius 3, flying at 5000 units per second from grid 0,0",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "0", "--grid-y", "0", "--stream-radius", "3", "--auto-fly-speed", "5000"]
+    },
+    "stress-still": {
+      "description": "the stress scene's stream radius 3, standing still at grid 0,0",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "args": ["--worldspace", "0x3c", "--grid-x", "0", "--grid-y", "0", "--stream-radius", "3"]
+    },
+    "stability": {
+      "description": "soak: Riverwood flying at 900 units per second, 30 minutes unless --duration says otherwise",
+      "needs_assets": true,
+      "warmup_frames": 300,
+      "default_duration": 1800,
+      "args": ["--worldspace", "0x3c", "--grid-x", "3", "--grid-y", "-12", "--auto-fly-speed", "900"]
+    },
+    "travel": {
+      "description": "the frame-time route (scripts/routes/travel.json); the window is at least the route's travel time plus 60 s",
+      "needs_assets": true,
+      "route": "routes/travel.json",
+      "args": ["--worldspace", "0x3c"]
+    },
+    "check": {
+      "description": "the held-out route (scripts/routes/check.json): report it, never tune against it",
+      "needs_assets": true,
+      "route": "routes/check.json",
+      "args": ["--worldspace", "0x3c"]
+    }
+  }
+}

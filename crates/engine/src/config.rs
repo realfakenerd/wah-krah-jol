@@ -123,6 +123,8 @@ pub struct EngineConfig {
     pub headless: bool,
     /// Keep a renderable window hidden for automated screenshot capture.
     pub hidden_window: bool,
+    /// Open the window below other windows and leave focus where it was.
+    pub background_window: bool,
     /// Whole color pipeline; fixed for the run because stages never mix across profiles.
     pub visual_profile: VisualProfile,
     /// Select the cinematic A/B experiment without changing scene lighting.
@@ -261,6 +263,7 @@ impl Default for EngineConfig {
             max_upload_mib_per_frame: 16,
             headless: false,
             hidden_window: false,
+            background_window: false,
             visual_profile: VisualProfile::Mudcrab,
             color_grade: SceneGradeMode::SnapshotSrgb,
             visual_preset: SceneVisualPreset::CoolGray,
@@ -348,6 +351,7 @@ Assets and start position:
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --hidden-window                       render screenshots without showing a window
+  --background-window                   open the window behind other windows without taking focus
   --lights                              place a point light for each streamed LIGH reference
 
 Streaming:
@@ -850,6 +854,7 @@ impl EngineConfig {
                 }
                 "--headless" => config.headless = true,
                 "--hidden-window" => config.hidden_window = true,
+                "--background-window" => config.background_window = true,
                 "--max-unloads-per-frame" => {
                     config.max_cell_unloads_per_frame = take_value(
                         "--max-unloads-per-frame",
@@ -1677,6 +1682,19 @@ mod tests {
     /// it instead of keeping a second list of option names in step by hand.
     const CONFIG_SOURCE: &str = include_str!("config.rs");
 
+    /// Options the perf harness passes to the programs it drives (git, cargo and
+    /// samply). Scoped to its directory so an engine launcher passing one still
+    /// fails the audit.
+    const PERF_HARNESS_TOOL_FLAGS: &[&str] = &[
+        "--detach",                  // git worktree add
+        "--force",                   // git worktree remove
+        "--show-toplevel",           // git rev-parse
+        "--verify",                  // git rev-parse
+        "--rate",                    // samply record
+        "--save-only",               // samply record
+        "--unstable-presymbolicate", // samply record
+    ];
+
     /// Flags owned by one release script: (file name, flag). Scoped like the
     /// observation tool's `--verify`, so any other script passing one of them
     /// to the engine still fails the audit.
@@ -2395,6 +2413,20 @@ mod tests {
                 .to_string()
                 .contains("--color-grade")
         );
+    }
+
+    /// A background capture keeps its window visible; only its stacking and focus change.
+    #[test]
+    fn parses_background_window_capture_mode() {
+        assert!(!EngineConfig::default().background_window);
+        let config = run_config(&[
+            "--background-window",
+            "--acceptance-screenshot",
+            "capture.png",
+        ]);
+        assert!(config.background_window);
+        assert!(!config.hidden_window);
+        assert!(!config.headless);
     }
 
     /// Hidden capture selects rendering without enabling interactive mouse ownership.
@@ -3559,6 +3591,13 @@ mod tests {
         paths
     }
 
+    fn is_perf_harness(path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|extension| extension == "py")
+            && path
+                .components()
+                .any(|part| part.as_os_str().to_str() == Some("perf"))
+    }
+
     fn checked_script_engine_flags(script: &str, path: &std::path::Path) -> usize {
         let options = parser_options();
         let mut checked = 0;
@@ -3571,8 +3610,15 @@ mod tests {
                 Some("lod-performance" | "lod-experiment")
             )
         });
+        // The perf harness has a command line of its own (`--window`, `--pairs`)
+        // beside the engine arguments it builds. Only complete option literals
+        // outside its parser declarations are engine arguments.
+        let harness_tool = is_perf_harness(path);
         let engine_lines: String;
-        let scanned = if converter_tool {
+        let scanned = if harness_tool {
+            engine_lines = emitted_python_options(script);
+            engine_lines.as_str()
+        } else if converter_tool {
             engine_lines = script
                 .lines()
                 .filter(|line| {
@@ -3591,12 +3637,17 @@ mod tests {
             let observation_option = path.file_name().is_some_and(|name| {
                 name == "reference-enable-observations.py" && flag == "--verify"
             });
+            let harness_option = harness_tool && PERF_HARNESS_TOOL_FLAGS.contains(&flag);
             let release_option = path.file_name().is_some_and(|name| {
                 SCRIPT_SCOPED_FLAGS
                     .iter()
                     .any(|&(script, scoped)| name == script && flag == scoped)
             });
-            if NON_ENGINE_FLAGS.contains(&flag) || observation_option || release_option {
+            if NON_ENGINE_FLAGS.contains(&flag)
+                || observation_option
+                || harness_option
+                || release_option
+            {
                 continue;
             }
             assert!(
@@ -3607,6 +3658,117 @@ mod tests {
             checked += 1;
         }
         checked
+    }
+
+    /// The option literals a Python harness can pass on to another program:
+    /// string literals that are exactly one `--option`, outside `add_argument(...)`
+    /// declarations (the harness's own parser), comments and prose strings.
+    fn emitted_python_options(script: &str) -> String {
+        let bytes = script.as_bytes();
+        let mut emitted = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'#' => {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                quote @ (b'"' | b'\'') => {
+                    let triple = bytes[index..].starts_with(&[quote; 3]);
+                    let start = index + if triple { 3 } else { 1 };
+                    let mut end = start;
+                    while end < bytes.len() {
+                        if bytes[end] == b'\\' {
+                            end += 2;
+                        } else if (triple && bytes[end..].starts_with(&[quote; 3]))
+                            || (!triple && (bytes[end] == quote || bytes[end] == b'\n'))
+                        {
+                            break;
+                        } else {
+                            end += 1;
+                        }
+                    }
+                    let end = end.min(bytes.len());
+                    let literal = &script[start..end];
+                    let preceded_by_prefix = start >= 2 && !triple && {
+                        // An f-string or raw string is prose or a pattern, not an option.
+                        matches!(bytes[start - 2], b'f' | b'r' | b'F' | b'R')
+                    };
+                    if !triple
+                        && !preceded_by_prefix
+                        && literal.starts_with("--")
+                        && option_tokens(literal).first() == Some(&literal)
+                    {
+                        emitted.push(literal);
+                    }
+                    index = (end + if triple { 3 } else { 1 }).min(bytes.len());
+                    continue;
+                }
+                b'a' if script[index..].starts_with("add_argument(") => {
+                    // Skip the whole call; the parentheses inside its help text balance.
+                    let mut depth = 0usize;
+                    let mut quote = None;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        match quote {
+                            Some(_) if byte == b'\\' => index += 1,
+                            Some(open) if byte == open => quote = None,
+                            Some(_) => {}
+                            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                            None if byte == b'(' => depth += 1,
+                            None if byte == b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            None => {}
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        emitted.join(" ")
+    }
+
+    #[test]
+    fn the_perf_harness_audit_reads_emitted_engine_options_only() {
+        let harness = std::path::Path::new("perf/perf.py");
+        let script = r#"
+            # --not-an-option in a comment
+            p.add_argument("--window", choices=W, help="auto (use --other, else visible)")
+            raise Error("use --window visible")
+            args = ["--headless", "--assets", str(a)]
+        "#;
+        assert_eq!(emitted_python_options(script), "--headless --assets");
+        assert_eq!(checked_script_engine_flags(script, harness), 2);
+        // The same declaration is still an engine argument anywhere else.
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags(script, std::path::Path::new("tool/other.py"))
+            })
+            .is_err()
+        );
+        // Tool options scoped to the harness stay refused in an engine launcher.
+        let tool = r#"cmd = ["git", "worktree", "remove", "--force"]"#;
+        assert_eq!(checked_script_engine_flags(tool, harness), 0);
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags(tool, std::path::Path::new("tool/other.py"))
+            })
+            .is_err()
+        );
+        // An unknown flag the harness passes on is refused.
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags(r#"args = ["--no-such-engine-flag"]"#, harness)
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,0 +1,42 @@
+{
+  "width": 1280,
+  "height": 720,
+  "shots": [
+    {
+      "name": "riverwood-terrace",
+      "worldspace_id": 60,
+      "position": [23400.0, -47100.0, 400.0],
+      "yaw": 315.0,
+      "pitch": 7.0,
+      "hfov": 75.0,
+      "note": "Village facade, shaded wood, terrain and distant geometry (grid 5,-12)."
+    },
+    {
+      "name": "riverwood-street",
+      "worldspace_id": 60,
+      "position": [21900.0, -46400.0, 20.0],
+      "yaw": 325.0,
+      "pitch": 0.0,
+      "hfov": 80.0,
+      "note": "Ground-level lane with stone, ivy and cutout foliage (grid 5,-12)."
+    },
+    {
+      "name": "riverwood-bridge",
+      "worldspace_id": 60,
+      "position": [21340.0, -44890.0, 520.0],
+      "yaw": 152.7,
+      "pitch": 7.9,
+      "hfov": 75.0,
+      "note": "The bridge from the south bank: water, terrain and a long view (grid 5,-11)."
+    },
+    {
+      "name": "riverwood-farmhouse",
+      "worldspace_id": 60,
+      "position": [22200.0, -46600.0, 160.0],
+      "yaw": 350.0,
+      "pitch": 0.0,
+      "hfov": 80.0,
+      "note": "Grazing farmhouse side wall for wood and stone materials (grid 5,-12)."
+    }
+  ]
+}

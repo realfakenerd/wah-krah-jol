@@ -177,3 +177,7 @@ On macOS, the same command also compiles and loads the native observer in short
 processes to check valid defaults, integer boundaries and rejected configuration.
 Those checks need the Command Line Tools and use no renderer or game assets;
 they are skipped on other platforms. They do not qualify a native capture.
+
+For repeatable base/candidate frame-time and screenshot comparisons, see the [performance loop](../../docs/contributing/perf-loop.md).
+`perf.py run --profiler metal-trace` builds and loads the observer for you, and `perf.py gpu-busy` reads the trace tolerantly
+(it reports dropped events instead of refusing the capture).
