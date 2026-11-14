@@ -94,7 +94,7 @@ impl InstanceBounds {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Clone, bevy::render::extract_component::ExtractComponent)]
 pub struct StreamingCamera;
 
 #[derive(Component)]

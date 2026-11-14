@@ -396,6 +396,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     if interactive_world_physics {
         app.add_plugins(crate::settings_ui::SettingsPlugin);
+    } else {
+        app.add_plugins(crate::settings::RenderSettingsPlugin);
     }
     add_camera_and_capture_systems(&mut app);
     if let Some(terrain_merge) = terrain_merge {

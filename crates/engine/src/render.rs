@@ -23,8 +23,12 @@ use bevy::{
         batching::gpu_preprocessing::{
             GpuPreprocessingMode, GpuPreprocessingSupport, IndirectParametersBuffers,
         },
+        camera::ExtractedCamera,
+        extract_component::ExtractComponentPlugin,
         occlusion_culling::OcclusionCulling,
         render_resource::{AsBindGroup, ShaderType},
+        renderer::RenderAdapterInfo,
+        view::NoIndirectDrawing,
     },
     shader::ShaderRef,
 };
@@ -132,6 +136,7 @@ impl Plugin for VercidiumRendererPlugin {
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
+            ExtractComponentPlugin::<crate::world::components::StreamingCamera>::default(),
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)
@@ -194,6 +199,8 @@ fn give_shadow_views_their_light_layers(
 
 #[derive(Resource, Debug, Clone, Default, Serialize)]
 pub struct RendererMetrics {
+    pub metal_backend: bool,
+    pub direct_drawing_views: u64,
     pub gpu_preprocessing_active: bool,
     pub gpu_culling_active: bool,
     pub indirect_drawing_active: bool,
@@ -208,13 +215,15 @@ pub struct RendererMetrics {
 
 impl RendererMetrics {
     pub fn final_path_active(&self) -> bool {
-        self.gpu_preprocessing_active
-            && self.gpu_culling_active
-            && self.indirect_drawing_active
-            && self.occlusion_culling_views > 0
-            && self.hzb_views > 0
-            && self.indirect_phase_buffers > 0
-            && self.indirect_batch_sets > 0
+        let direct_metal = self.metal_backend && self.direct_drawing_views > 0;
+        (direct_metal
+            || (self.gpu_preprocessing_active
+                && self.gpu_culling_active
+                && self.indirect_drawing_active
+                && self.occlusion_culling_views > 0
+                && self.hzb_views > 0
+                && self.indirect_phase_buffers > 0
+                && self.indirect_batch_sets > 0))
             && self.proof_frames > 0
             && self.renderer_validation_failures == 0
     }
@@ -229,21 +238,34 @@ struct RendererProofState {
     hzb_views: AtomicU64,
     indirect_phases: AtomicU64,
     indirect_batch_sets: AtomicU64,
+    direct_views: AtomicU64,
+    metal_backend: AtomicBool,
     frames: AtomicU64,
 }
 
 #[derive(Resource, Clone, Default)]
 struct RendererProofBridge(Arc<RendererProofState>);
 
+type DirectWorldViewFilter = (
+    With<ExtractedCamera>,
+    With<crate::world::components::StreamingCamera>,
+    With<NoIndirectDrawing>,
+);
+
 fn sample_renderer_path(
     bridge: Res<RendererProofBridge>,
     support: Option<Res<GpuPreprocessingSupport>>,
     indirect: Option<Res<IndirectParametersBuffers>>,
+    adapter: Option<Res<RenderAdapterInfo>>,
     views: Query<Option<&ViewDepthPyramid>, With<OcclusionCulling>>,
+    direct_views: Query<(), DirectWorldViewFilter>,
 ) {
-    let Some(support) = support else { return };
-    let preprocessing = support.is_available();
-    let culling = support.max_supported_mode == GpuPreprocessingMode::Culling;
+    let preprocessing = support
+        .as_deref()
+        .is_some_and(GpuPreprocessingSupport::is_available);
+    let culling = support
+        .as_deref()
+        .is_some_and(|value| value.max_supported_mode == GpuPreprocessingMode::Culling);
     let (phase_count, batch_sets, indirect_active) =
         indirect.as_deref().map_or((0, 0, false), |buffers| {
             let phases = buffers.len() as u64;
@@ -260,6 +282,8 @@ fn sample_renderer_path(
         });
     let occlusion_views = views.iter().count() as u64;
     let hzb_views = views.iter().filter(|pyramid| pyramid.is_some()).count() as u64;
+    let direct_views = direct_views.iter().count() as u64;
+    let metal_backend = adapter.is_some_and(|value| value.backend == wgpu::Backend::Metal);
     bridge
         .0
         .gpu_preprocessing
@@ -282,6 +306,14 @@ fn sample_renderer_path(
         .0
         .indirect_batch_sets
         .fetch_max(batch_sets, Ordering::Relaxed);
+    bridge
+        .0
+        .direct_views
+        .fetch_max(direct_views, Ordering::Relaxed);
+    bridge
+        .0
+        .metal_backend
+        .fetch_or(metal_backend, Ordering::Relaxed);
     bridge.0.frames.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -294,6 +326,8 @@ fn sync_renderer_metrics(bridge: Res<RendererProofBridge>, mut metrics: ResMut<R
     metrics.indirect_phase_buffers = bridge.0.indirect_phases.load(Ordering::Relaxed);
     metrics.indirect_batch_sets = bridge.0.indirect_batch_sets.load(Ordering::Relaxed);
     metrics.proof_frames = bridge.0.frames.load(Ordering::Relaxed);
+    metrics.direct_drawing_views = bridge.0.direct_views.load(Ordering::Relaxed);
+    metrics.metal_backend = bridge.0.metal_backend.load(Ordering::Relaxed);
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
@@ -1979,6 +2013,88 @@ mod tests {
             }
             .final_path_active()
         );
+    }
+
+    #[test]
+    fn reflection_alone_cannot_prove_direct_world_drawing() {
+        use crate::world::components::StreamingCamera;
+        use bevy::render::camera::CameraRenderGraph;
+        let extracted = || {
+            let camera = Camera::default();
+            ExtractedCamera {
+                target: None,
+                physical_viewport_size: None,
+                physical_target_size: None,
+                viewport: None,
+                schedule: CameraRenderGraph::new(bevy::core_pipeline::schedule::Core3d).0,
+                order: 0,
+                output_mode: camera.output_mode,
+                msaa_writeback: camera.msaa_writeback,
+                clear_color: camera.clear_color,
+                sorted_camera_index_for_target: 0,
+                exposure: 1.0,
+                hdr: false,
+                compositing_space: None,
+            }
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(RendererProofBridge::default())
+            .add_systems(Update, sample_renderer_path);
+        let world = app.world_mut().spawn((extracted(), StreamingCamera)).id();
+        app.world_mut().spawn((extracted(), NoIndirectDrawing));
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<RendererProofBridge>()
+                .0
+                .direct_views
+                .load(Ordering::Relaxed),
+            0
+        );
+        app.world_mut().entity_mut(world).insert(NoIndirectDrawing);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<RendererProofBridge>()
+                .0
+                .direct_views
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_path_requires_metal_and_a_proven_direct_view() {
+        let direct = RendererMetrics {
+            metal_backend: true,
+            direct_drawing_views: 2,
+            proof_frames: 1,
+            ..default()
+        };
+        assert!(direct.final_path_active());
+        assert!(
+            !RendererMetrics {
+                direct_drawing_views: 0,
+                ..direct.clone()
+            }
+            .final_path_active()
+        );
+        assert!(
+            !RendererMetrics {
+                metal_backend: false,
+                ..direct.clone()
+            }
+            .final_path_active()
+        );
+        assert!(
+            !RendererMetrics {
+                proof_frames: 0,
+                ..direct.clone()
+            }
+            .final_path_active()
+        );
+        assert!(!RendererMetrics::default().final_path_active());
     }
 
     /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures

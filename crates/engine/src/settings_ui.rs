@@ -349,7 +349,11 @@ fn menu_actions(
                 }
             }
             MenuAction::Adjust(index, direction) => {
+                let drawing_before = (settings.indirect_drawing, settings.occlusion_culling);
                 SETTING_SPECS[index].adjust(&mut settings, direction);
+                if drawing_before != (settings.indirect_drawing, settings.occlusion_culling) {
+                    file.note_drawing_selection();
+                }
                 file.status = "Changed for this session. Choose Save to keep settings.".into();
             }
             MenuAction::CollisionDebug => {
