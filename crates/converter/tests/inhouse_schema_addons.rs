@@ -811,6 +811,119 @@ async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
     );
 }
 
+/// A malformed (too short) FNAM or XRDS is rejected by the in-house decoder before export. Both
+/// readers must still publish the same "malformed" status (2), not "absent" (0) for that reader.
+#[tokio::test]
+async fn short_light_fade_and_radius_publish_the_same_status_for_both_readers() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    generate(&data);
+    let plugin = data.join("Skyrim.esm");
+    let light_data = |radius: u32| -> Vec<u8> {
+        let mut bytes = (-1i32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&radius.to_le_bytes());
+        bytes.extend_from_slice(&[255, 200, 120, 0]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 28]);
+        assert_eq!(bytes.len(), 48);
+        bytes
+    };
+    let (short_fade_light, valid_fade_light) = (0x1A00u32, 0x1A01u32);
+    append(
+        &plugin,
+        &[
+            record(
+                b"LIGH",
+                short_fade_light,
+                &[
+                    (*b"EDID", b"ShortFadeLight\0".to_vec()),
+                    (*b"DATA", light_data(256)),
+                    (*b"FNAM", vec![0xAE, 0x18]),
+                ],
+            ),
+            record(
+                b"LIGH",
+                valid_fade_light,
+                &[
+                    (*b"EDID", b"ValidFadeLight\0".to_vec()),
+                    (*b"DATA", light_data(256)),
+                    (*b"FNAM", 1.0f32.to_le_bytes().to_vec()),
+                ],
+            ),
+        ]
+        .concat(),
+    );
+    let transform: Vec<u8> = [10.0f32, 20.0, 30.0, 0.0, 0.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    // (reference id, base light, XRDS bytes)
+    let references = [
+        (0x1A10u32, short_fade_light, Some(vec![0xAE, 0x18])),
+        (0x1A11, valid_fade_light, None),
+        (
+            0x1A12,
+            valid_fade_light,
+            Some(25.0f32.to_le_bytes().to_vec()),
+        ),
+    ];
+    let cell_id = 0x1A20u32;
+    let mut cell_children = Vec::new();
+    for (id, base, radius) in &references {
+        let mut fields = vec![(*b"NAME", base.to_le_bytes().to_vec())];
+        if let Some(radius) = radius {
+            fields.push((*b"XRDS", radius.clone()));
+        }
+        fields.push((*b"DATA", transform.clone()));
+        cell_children.extend(record(b"REFR", *id, &fields));
+    }
+    let mut world_children = record(
+        b"CELL",
+        cell_id,
+        &[
+            (*b"EDID", b"ShortLightFieldsCell\0".to_vec()),
+            (
+                *b"XCLC",
+                [12i32.to_le_bytes(), (-9i32).to_le_bytes()].concat(),
+            ),
+        ],
+    );
+    world_children.extend(group(9, cell_id, &cell_children));
+    append(&plugin, &group(1, 1, &world_children));
+
+    for reader in [RecordReader::Legacy, RecordReader::Inhouse] {
+        let output = temp.path().join(format!("pack-{reader:?}"));
+        publish_with_reader(&data, &output, reader).await;
+        let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let fade = |id: u32| -> (Option<f64>, i64) {
+            db.query_row(
+                "SELECT fade, fade_status FROM lights WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let radius = |id: u32| -> (Option<f64>, i64) {
+            db.query_row(
+                "SELECT radius_override, radius_status FROM \"references\" WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(fade(short_fade_light), (None, 2), "{reader:?} short FNAM");
+        assert_eq!(
+            fade(valid_fade_light),
+            (Some(1.0), 1),
+            "{reader:?} valid FNAM"
+        );
+        assert_eq!(radius(0x1A10), (None, 2), "{reader:?} short XRDS");
+        assert_eq!(radius(0x1A11), (None, 0), "{reader:?} absent XRDS");
+        assert_eq!(radius(0x1A12), (Some(25.0), 1), "{reader:?} valid XRDS");
+    }
+}
+
 /// Author the runtime extension independently of the compiled schema and its builder.
 fn addon_bytes() -> Vec<u8> {
     serde_json::to_vec_pretty(&json!({

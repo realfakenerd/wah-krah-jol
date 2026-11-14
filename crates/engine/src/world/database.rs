@@ -59,7 +59,7 @@ pub struct ReferenceRow {
     /// a `LIGH`. `None` for every other reference, and for every reference in a database converted
     /// before lights were exported.
     pub light: Option<LightRow>,
-    /// The reference's own light radius (`XRDS`), which wins over [`LightRow::radius`]. `None` when
+    /// The reference's signed light-radius offset (`XRDS`), added to [`LightRow::radius`]. `None` when
     /// the reference carries no override, and in a database converted before the column existed.
     pub light_radius_override: Option<f32>,
     /// The 8-bit sRGB colour the reference's `XEMI` light or region lends its model's
@@ -100,6 +100,26 @@ pub struct LightRow {
     pub color: [u8; 3],
     /// `DATA`'s flags, uninterpreted; see the flag bits in [`crate::lights`].
     pub flags: u32,
+    /// Authored FNAM; absent/invalid values use a labelled compatibility fallback.
+    pub fade: Option<f32>,
+    /// 0 absent, 1 valid (including zero), 2 invalid; None for older projections.
+    pub fade_status: Option<u8>,
+    /// Authored DATA falloff, retained even where the backend cannot evaluate it.
+    pub falloff: Option<f32>,
+    /// The placing reference's XLIG projection, absent in older packages.
+    pub reference_data: Option<ReferenceLightRow>,
+    /// Placing reference's XRDS state: 0 absent, 1 valid signed offset, 2 malformed.
+    pub radius_status: Option<u8>,
+}
+
+/// Raw XLIG inputs, not effective multipliers. NULL fields retain malformed/non-finite status.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReferenceLightRow {
+    pub data_size: u32,
+    pub fov_offset: Option<f32>,
+    pub fade_offset: Option<f32>,
+    pub end_distance_cap: Option<f32>,
+    pub shadow_depth_bias: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -840,7 +860,7 @@ const LIGHT_COLUMNS: &str = "l.radius,l.color_r,l.color_g,l.color_b,l.flags";
 /// reads as unlit, with the column order unchanged.
 const ABSENT_LIGHT_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL";
 
-/// The reference's own `XRDS` light radius, which wins over the record's. The column arrived with
+/// The reference's signed XRDS radius offset, added to the base radius. The column arrived with
 /// the `lights` table in conversion schema 4; a database from before it has no such column.
 const RADIUS_OVERRIDE_COLUMN: &str = "r.radius_override";
 const ABSENT_RADIUS_OVERRIDE_COLUMN: &str = "NULL";
@@ -1026,11 +1046,46 @@ impl ReferenceQuery {
             0 => "0,NULL,0",
             _ => "r.header_flags,r.enable_parent_id,r.enable_parent_flags",
         };
+        let optional_light_column = |name: &str| -> Result<String> {
+            let present: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('lights') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            Ok(if present {
+                format!("l.{name}")
+            } else {
+                "NULL".into()
+            })
+        };
+        let has_radius_status: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('references') WHERE name='radius_status')",
+            [], |row| row.get(0),
+        )?;
+        let radius_status_column = if has_radius_status {
+            "r.radius_status"
+        } else {
+            "NULL"
+        };
+        let fade_column = optional_light_column("fade")?;
+        let falloff_column = optional_light_column("falloff")?;
+        let fade_status_column = optional_light_column("fade_status")?;
+        let light_data_count: usize = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('reference_light_data') WHERE name IN \
+             ('reference_id','data_size','fov_offset','fade_offset','end_distance_cap','shadow_depth_bias')",
+            [], |row| row.get(0),
+        )?;
+        let reference_light_columns = if light_data_count == 6 {
+            joins.push_str(" LEFT JOIN reference_light_data rl ON rl.reference_id=r.id");
+            "rl.data_size,rl.fov_offset,rl.fade_offset,rl.end_distance_cap,rl.shadow_depth_bias"
+        } else {
+            "NULL,NULL,NULL,NULL,NULL"
+        };
         Ok(Self {
             columns: format!(
                 "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
                  {door_columns},{emittance_columns},{reference_enable_columns},\
-                 {STATIC_FLAGS_COLUMN}"
+                 {STATIC_FLAGS_COLUMN},{fade_column},{falloff_column},{reference_light_columns},{fade_status_column},{radius_status_column}"
             ),
             joins,
             parent_sql: format!("SELECT {enable_columns} FROM \"references\" WHERE id=?1"),
@@ -1152,6 +1207,22 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
             radius,
             color: [row.get(20)?, row.get(21)?, row.get(22)?],
             flags: row.get(23)?,
+            radius_status: row.get(STATIC_FLAGS_INDEX + 9)?,
+            fade: row.get(STATIC_FLAGS_INDEX + 1)?,
+            fade_status: row.get(STATIC_FLAGS_INDEX + 8)?,
+            falloff: row.get(STATIC_FLAGS_INDEX + 2)?,
+            reference_data: row
+                .get::<_, Option<u32>>(STATIC_FLAGS_INDEX + 3)?
+                .map(|data_size| {
+                    Ok::<_, rusqlite::Error>(ReferenceLightRow {
+                        data_size,
+                        fov_offset: row.get(STATIC_FLAGS_INDEX + 4)?,
+                        fade_offset: row.get(STATIC_FLAGS_INDEX + 5)?,
+                        end_distance_cap: row.get(STATIC_FLAGS_INDEX + 6)?,
+                        shadow_depth_bias: row.get(STATIC_FLAGS_INDEX + 7)?,
+                    })
+                })
+                .transpose()?,
         }),
         None => None,
     };
@@ -2438,6 +2509,11 @@ mod tests {
                 radius: 256.0,
                 color: [255, 150, 80],
                 flags: 8,
+                fade: None,
+                fade_status: None,
+                falloff: None,
+                reference_data: None,
+                radius_status: None,
             })
         );
         assert_eq!(

@@ -7,8 +7,8 @@ use crate::{
         RecordConversion,
         cell_cache::validate_inhouse_land,
         exporter::{
-            create_tables, export_inhouse_record_archive_to_db, export_inhouse_to_db,
-            validate_inhouse_record,
+            RejectedLightFields, RejectedLightInputs, create_tables,
+            export_inhouse_record_archive_to_db, export_inhouse_to_db, validate_inhouse_record,
         },
         load_order::LoadOrder,
         records::RawRecord,
@@ -126,6 +126,7 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "reference_linked_refs",
     "reference_activate_parents",
     "reference_details",
+    "reference_light_data",
     "door_links",
     "emittance",
 ];
@@ -965,6 +966,9 @@ fn convert_plugins_with_text_sources_report_impl(
     let projection_stage = records::profile::ProfileStage::start("typed_export_runtime_projection");
     let mut master = HashMap::with_capacity(decoded.records.len());
     let mut opaque_fields = HashMap::new();
+    // Malformed FNAM/XRDS are rejected before export; remember them so the light status columns
+    // match the legacy reader's "malformed" instead of reading "absent".
+    let mut rejected_light_fields = RejectedLightFields::new();
     // Sort compact keys, leaving record payloads in place and streaming one JSON line at a time.
     // The same traversal fixes localized provenance rowids when no typed dump is requested.
     let mut record_keys = decoded
@@ -1110,6 +1114,13 @@ fn convert_plugins_with_text_sources_report_impl(
             records::typed_export::write_record(writer, record, &localization)?;
             writer.write_all(b"\n")?;
         }
+        let rejected_light = RejectedLightInputs {
+            fnam: record.rejected_fields.contains(b"FNAM"),
+            xrds: record.rejected_fields.contains(b"XRDS"),
+        };
+        if rejected_light != RejectedLightInputs::default() {
+            rejected_light_fields.insert(record.form_id, rejected_light);
+        }
         // Typed fields and the source digest have been written before ownership moves.
         let mut raw = take_canonical_record(record);
         for (index, text) in runtime_text_updates {
@@ -1175,6 +1186,7 @@ fn convert_plugins_with_text_sources_report_impl(
             plugin_paths,
             &unresolved_fields,
             &terrain_offsets,
+            Some(&rejected_light_fields),
         )?;
     } else {
         export_inhouse_record_archive_to_db(&conn, &master, &order, plugin_paths)?;

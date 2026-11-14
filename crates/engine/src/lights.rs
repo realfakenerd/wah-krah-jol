@@ -10,83 +10,18 @@
 //! This module owns the record-to-light conversion, the intensity scale, and the budget that bounds
 //! how many lights are enabled at once.
 //!
-//! # The intensity scale: Creation units are not metres
+//! Authored inputs and the Bevy compatibility transform are separate. Signed XRDS is added to
+//! the base radius; FNAM plus XLIG fade scales luminous power. DATA falloff applies only to
+//! native shadow modes, which this point-light adapter does not reproduce. See the spec for pinned sources and unresolved native equations.
 //!
-//! A `LIGH` row carries its radius in Creation units and this engine renders one Creation unit as
-//! one Bevy world unit ([`CELL_SIZE`](crate::world::components::CELL_SIZE) is 4096 units across a
-//! cell the game defines as 4096 Creation units), so `range` is the radius unchanged. Intensity is
-//! what needs converting: Bevy's defaults are tuned for a metre-scale world, and in this world the
-//! same distance is about 70 times larger, which loses a factor of 4900 to the inverse-square term.
-//!
-//! Bevy's point light contributes, at distance `d` from it,
-//!
-//! ```text
-//! Lout = albedo * NdotL * (colour * intensity / (4*PI)) * window(d) / (PI * d^2)
-//!      = albedo * NdotL * colour * intensity * window(d) / (4 * PI^2 * d^2)
-//! window(d) = (1 - (d/range)^4)^2
-//! ```
-//!
-//! The two `PI`s are easy to lose, and an earlier version of this derivation lost one of them.
-//! `bevy_pbr/src/render/light.rs` divides a point light's intensity by `4*PI` on the CPU - Bevy's
-//! `PointLight::intensity` is luminous power in lumens and the shader wants lumens per steradian
-//! (`ExtractedPointLight`, `intensity: point_light.intensity / (4.0 * PI)`) - and `Fd_Burley` in
-//! `bevy_pbr/src/render/pbr_lighting.wgsl` supplies the Lambert `1/PI`. Written out with only the
-//! second one, as this module did, the light comes out `4*PI` too dim for the intensity asked for.
-//!
-//! The ambient light of `crate::app` contributes `albedo * ambient_colour * brightness` - no `NdotL`
-//! and no `1/PI` (`bevy_pbr/src/render/light.rs`, `ambient_color: ... * ambient_light.brightness`,
-//! and `pbr_ambient.wgsl`, `EnvBRDFApprox(diffuse_color, ..) * lights.ambient_color.rgb`). A
-//! converted light is therefore given the intensity that makes the two equal at half its own
-//! radius, times [`LIGHT_EXPOSURE`]:
-//!
-//! ```text
-//! intensity = 4 * PI^2 * brightness * LIGHT_EXPOSURE * (radius/2)^2 / window(radius/2)
-//! window(radius/2) = (1 - 1/16)^2 = 225/256
-//! ```
-//!
-//! so `LIGHT_EXPOSURE` is the whole brightness knob for every converted light, in units of the
-//! ambient the engine actually applies ([`AMBIENT_ILLUMINANCE`], the brightness the world path of
-//! `crate::app` inserts into `GlobalAmbientLight`), and a 512-unit torch (a common `LIGH` radius)
-//! gets about `4.7e9`. The light's own colour scales what a surface receives on top of that, as the
-//! ambient's colour does on its side.
-//!
-//! # Why the reference distance stops at 256 units
-//!
-//! Sizing every light's intensity from its own `radius/2` reads the radius as brightness as well as
-//! reach, and a `LIGH` radius is only reach: Skyrim's brightness scale is `FNAM` fade, and the
-//! game's own attenuation is not inverse-square. One shipped record shows the difference at a
-//! glance: a radius of 4334 is 71 times a 512-unit torch's reference radius, so a light sized from
-//! its own radius came out 71 times a torch and washed out the space it hangs in - so the reference
-//! distance is capped at [`INTENSITY_REFERENCE_RADIUS`]. Every radius up to twice that cap keeps
-//! exactly the intensity the scale was written with, and a bigger light keeps its reach without a
-//! brightness that grows with the square of it.
-//!
-//! # The budget
-//!
-//! [`budget_lights`] enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera and hides the
-//! rest. A whole hall of `LIGH` references is common, and Bevy's clustered forward renderer draws
-//! every enabled light that reaches a cluster, so the far ones are switched off rather than paid
-//! for.
-//!
-//! The choice is cached, and re-made when the camera has moved [`BUDGET_RECHOOSE_DISTANCE`], when a
-//! light has spawned or despawned, or when the set of lights has changed in any other way - a cell
-//! streaming in or out at an equal count ([`LightBudget::chosen`]). Keying the cache on the number
-//! of spawned lights alone left a room walked into and stopped in dark until the player moved
-//! another 256 units.
-//!
-//! # What is not done here
-//!
-//! A `LIGH` record's attenuation exponent, `FOV` and near clip are not applied: Bevy's point light
-//! decays inverse-square and has neither a cone nor a near clip. Flicker, pulse, `FNAM` fade and
-//! the `DATA` time field are not implemented either - a torch burns steadily. Shadows are off for
-//! every converted light (`PointLight::shadow_maps_enabled` is one cube map per light, which a
-//! 64-light budget cannot afford; the record's own shadow flags are left for later), so a light
-//! also lights the far side of the wall it is mounted on. The reference's `XRDS` radius override *is* applied; see
-//! [`radius_of`].
+//! The backend retains the baseline's intensity normalization, frozen independently of global
+//! ambient. This is a compatibility fallback, not a calibrated Skyrim radiometric conversion.
+//! The renderer still uses inverse-square attenuation, unshadowed point lights and sRGB colours.
+//! The 64-light budget and 256-unit intensity reference cap remain backend policy.
 
 use crate::world::{components::StreamingCamera, database::LightRow};
 use bevy::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// `LIGH` `DATA` flag bit: the record is off until something turns it on, so a reference to it is
 /// not lit by default (UESP, "Skyrim Mod:Mod File Format/LIGH").
@@ -102,27 +37,7 @@ pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
 /// Like [`LIGHT_FLAG_OFF_BY_DEFAULT`], no shipped record sets it.
 pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 
-/// The ambient brightness the engine applies in its world path, in Bevy's ambient units: the
-/// `brightness` the world startup of `crate::app` inserts beside its `GlobalAmbientLight` colour.
-///
-/// This is the illuminance converted lights are stated against, so [`LIGHT_EXPOSURE`] is a ratio
-/// of configured inputs in this scale. It is not a measured or rendered ratio: Bevy's PBR ambient
-/// path applies an environment-BRDF approximation and specular terms, so a surface's rendered
-/// ambient is not `albedo * brightness`, and no native capture has matched this scale to Skyrim.
-/// A run that lights the world differently - the fixture paths of `crate::app` each insert their
-/// own ambient - is not the world this scale is written for, and the value has to be re-derived
-/// if per-space ambient lands.
-///
-/// Simplified heuristic: Skyrim lights a surface with `albedo * (ambient + sunlight * 2.8 *
-/// NdotL)`, and Bevy's sun adds `albedo * illuminance / PI * NdotL` against an ambient input of
-/// `brightness`. Equating the sun and ambient input ratios gives `brightness = illuminance / (PI *
-/// 2.8)`. The sun and ambient colours carry the weather's own hues (`crate::sky::WeatherLighting`),
-/// so this number sets only their relative input level.
-///
-/// Intended 219 change, uncalibrated: the world ambient brightness moves from the previous
-/// engine value of 160 to about 1364 (`1364.2`, about 8.5 times). Converted light intensities are
-/// expressed against this value, so they scale by the same factor. Both need matched native
-/// qualification before any claim about the rendered result.
+/// Global environment policy, independent of the local-light compatibility transform.
 pub const AMBIENT_ILLUMINANCE: f32 = SUN_ILLUMINANCE / (core::f32::consts::PI * SUNLIGHT_SCALE);
 
 /// The sun's illuminance in the world path, in lux. With the scene's EV100 of 9.7 this puts a
@@ -134,40 +49,234 @@ pub const SUN_ILLUMINANCE: f32 = 12_000.0;
 /// 20261010.md`, "SunlightScale remains 2.8").
 pub const SUNLIGHT_SCALE: f32 = 2.8;
 
-/// How many times the ambient a converted light puts on a surface at half its own radius. This one
-/// constant is the brightness knob for every converted light.
-///
-/// The delivery is per radius and not per record: a light delivers `LIGHT_EXPOSURE` times the
-/// ambient at `radius/2`, falls to zero at `radius`, and is inverse-square in between, so the value
-/// sets how bright a torch pool reads against the room around it. The intensity scale is chosen per
-/// radius so that every `LIGH` record delivers the same surface brightness at half its own reach,
-/// which is what makes one number usable for a 75-unit Dwarven lamp and a 3300-unit water light
-/// alike.
-///
-/// Ten is a round default rather than a measured one: at half its radius a light is configured to
-/// deliver ten times the ambient input level, an order of magnitude. That is an input-scale choice.
-/// It is not fitted to any image, no native capture has checked how a pool reads against the room,
-/// and tuning it is a later pass - see `docs/specs/engine/point-lights.md`.
-pub const LIGHT_EXPOSURE: f32 = 10.0;
+/// Frozen b5259d33 half-radius diffuse-radiance normalization: 12000/(PI*2.8)*10.
+/// This retains the baseline input scale, rather than adding a new dimming coefficient. It is
+/// explicitly a legacy fallback until native light units/attenuation are recovered (#264/#364).
+/// Changing SUN_ILLUMINANCE or AMBIENT_ILLUMINANCE cannot change local lights.
+const LEGACY_HALF_RADIUS_RADIANCE: f32 = 12_000.0 / (core::f32::consts::PI * 2.8) * 10.0;
 
-/// The largest reference distance [`intensity_for_radius`] sizes a light's intensity from: a light
-/// with a radius up to `2 * INTENSITY_REFERENCE_RADIUS` is lit at its own `radius/2`, a bigger one
-/// at this distance whatever its radius.
-///
-/// The cap is what keeps a radius from meaning brightness as well as reach (see the module
-/// documentation). 512 units of radius is the widest common `LIGH` radius, so every light up to it
-/// is byte-identical to the formula the scale was written with; a 4334-unit record drops from 71
-/// times a torch to exactly one torch, at the same reach.
+/// Backend compatibility cap in Creation units; not an authored brightness/range relationship.
 pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
-
-/// The illuminance a converted light is tuned to deliver at half its own radius, in Bevy's ambient
-/// units: [`LIGHT_EXPOSURE`] times the ambient the world path applies ([`AMBIENT_ILLUMINANCE`]).
-const HALF_RADIUS_ILLUMINANCE: f32 =
-    4.0 * core::f32::consts::PI * core::f32::consts::PI * AMBIENT_ILLUMINANCE * LIGHT_EXPOSURE;
-
-/// Bevy's range window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
-/// (`bevy_pbr/src/render/pbr_lighting.wgsl`, `getRangeFalloff`).
 const HALF_RADIUS_WINDOW: f32 = 225.0 / 256.0;
+
+/// Backend transform identity, retained on every evaluated light reference.
+pub const LIGHT_TRANSFORM: &str = "bevy-point-legacy-normalization-v1";
+
+/// Spawn-time diagnostics. Raw inputs stay on the reference, including unsupported fields.
+#[derive(Component, Debug, Clone)]
+pub struct LightEvaluation {
+    pub source: LightRow,
+    pub radius_offset: Option<f32>,
+    pub authored_radius: Option<f64>,
+    pub backend_range: Option<f32>,
+    /// Base FNAM after legacy/malformed fallback, before the additive reference offset.
+    pub base_fade: f32,
+    /// Native base-plus-reference fade before the backend's nonnegative finite bound.
+    pub authored_fade: f64,
+    pub effective_fade: f32,
+    pub reference_fade_applied: bool,
+    pub invalid_reference_fade: bool,
+    pub native_radius_fallback: bool,
+    /// Native constructor uses DATA falloff only for flags 0x1c00, otherwise 1.
+    pub native_falloff: Option<f32>,
+    pub legacy_fade: bool,
+    pub invalid_fade: bool,
+    pub invalid_radius: bool,
+    pub backend_limited: bool,
+    /// An FNAM or XLIG fade equal to the `f32::MAX` sentinel meant "no fade" and was not applied.
+    pub fade_sentinel: bool,
+    /// A finite XRDS offset above [`MAX_RADIUS_OVERRIDE`] was ignored and the base radius kept.
+    pub radius_offset_ignored: bool,
+    pub unsupported_reference_data: bool,
+    pub malformed_reference_data: bool,
+    pub unsupported_falloff: bool,
+    pub suppressed_flags: bool,
+    pub transform: &'static str,
+}
+
+impl LightEvaluation {
+    /// The actual streaming consumer uses this conversion for both immediate and deferred lights.
+    pub fn point_light(&self) -> Option<PointLight> {
+        if self.suppressed_flags {
+            return None;
+        }
+        Some(PointLight {
+            color: Color::srgb_u8(
+                self.source.color[0],
+                self.source.color[1],
+                self.source.color[2],
+            ),
+            intensity: (f64::from(intensity_for_radius(self.backend_range?))
+                * f64::from(self.effective_fade))
+            .min(f64::from(f32::MAX)) as f32,
+            range: self.backend_range?,
+            shadow_maps_enabled: false,
+            ..default()
+        })
+    }
+}
+
+/// Resolve supported inputs without modifying their stored values. XRDS is an additive signed
+/// offset (xEdit wbREFRRadiusToStr). Invalid present offsets are rejected, not replaced by base
+/// radius. The native constructor replaces nonpositive sums with 0.1. XLIG fade is an additive
+/// offset. An `f32::MAX` fade, in FNAM or XLIG, is the native "no fade" sentinel: this backend
+/// cannot emit "unbounded power", so the sentinel is not applied and the light keeps the unit
+/// (or authored base) fade instead of becoming a maximum-intensity light.
+///
+/// A finite XRDS offset above [`MAX_RADIUS_OVERRIDE`] is an outlier. The registered pack holds ten
+/// such references: nine in retail data (Skyrim.esm and Dragonborn.esm, 15,967 up to 3,736,737
+/// units) and one in a Creation Club plugin (9,505.58, ccbgssse031-advcyrus.esm). The pre-additive code ignored it and kept the record radius; that
+/// is preserved so those lights do not jump to the range cap. Native 1.7.104 evidence is pinned in
+/// the spec.
+pub fn evaluate_light(light: &LightRow, radius_offset: Option<f32>) -> LightEvaluation {
+    let radius_offset_ignored =
+        radius_offset.is_some_and(|offset| offset.is_finite() && offset > MAX_RADIUS_OVERRIDE);
+    let applied_offset = if radius_offset_ignored {
+        None
+    } else {
+        radius_offset
+    };
+    let authored_radius = (light.radius_status != Some(2)
+        && light.radius.is_finite()
+        && applied_offset.is_none_or(f32::is_finite))
+    .then(|| f64::from(light.radius) + f64::from(applied_offset.unwrap_or(0.0)));
+    let native_radius_fallback = authored_radius.is_some_and(|radius| radius <= 0.0);
+    let backend_range = authored_radius.map(|radius| {
+        if radius <= 0.0 {
+            NATIVE_NONPOSITIVE_RADIUS
+        } else {
+            radius.min(f64::from(MAX_RADIUS_OVERRIDE)) as f32
+        }
+    });
+    let base_fade_sentinel = light.fade == Some(f32::MAX);
+    let invalid_fade = light.fade_status == Some(2)
+        || light
+            .fade
+            .is_some_and(|fade| !fade.is_finite() || fade < 0.0);
+    let base_fade = if invalid_fade || base_fade_sentinel {
+        1.0
+    } else {
+        light
+            .fade
+            .filter(|fade| fade.is_finite() && *fade >= 0.0)
+            .unwrap_or(1.0)
+    };
+    let reference_fade_raw = light.reference_data.as_ref().and_then(|data| {
+        [16, 20]
+            .contains(&data.data_size)
+            .then_some(data.fade_offset)
+            .flatten()
+            .filter(|fade| fade.is_finite())
+    });
+    let reference_fade_sentinel = reference_fade_raw == Some(f32::MAX);
+    let reference_fade = reference_fade_raw.filter(|fade| *fade != f32::MAX);
+    let invalid_reference_fade = light.reference_data.is_some() && reference_fade_raw.is_none();
+    let authored_fade = match reference_fade {
+        Some(offset) => f64::from(base_fade) + f64::from(offset),
+        None => f64::from(base_fade),
+    };
+    // Keep the authored signed result. Bevy's additive light backend cannot emit negative power.
+    let effective_fade = authored_fade.clamp(0.0, f64::from(f32::MAX)) as f32;
+    let shadow_mode = light.flags & LIGHT_FLAG_SHADOW_MODES != 0;
+    let native_falloff = if shadow_mode {
+        light.falloff.filter(|value| value.is_finite())
+    } else {
+        Some(1.0)
+    };
+    let malformed_reference_data = light.reference_data.as_ref().is_some_and(|data| {
+        ![16, 20].contains(&data.data_size)
+            || [
+                data.fov_offset,
+                data.fade_offset,
+                data.end_distance_cap,
+                data.shadow_depth_bias,
+            ]
+            .iter()
+            .any(|value| value.is_none_or(|v| !v.is_finite()))
+    });
+    LightEvaluation {
+        source: light.clone(),
+        radius_offset,
+        authored_radius,
+        backend_range,
+        base_fade,
+        authored_fade,
+        effective_fade,
+        reference_fade_applied: reference_fade.is_some(),
+        invalid_reference_fade,
+        native_radius_fallback,
+        native_falloff,
+        legacy_fade: light.fade.is_none() || invalid_fade || base_fade_sentinel,
+        invalid_fade,
+        invalid_radius: authored_radius.is_none(),
+        backend_limited: authored_fade < 0.0
+            || authored_fade > f64::from(f32::MAX)
+            || radius_offset_ignored
+            || authored_radius.is_some_and(|radius| radius > f64::from(MAX_RADIUS_OVERRIDE))
+            || f64::from(intensity_for_radius(backend_range.unwrap_or(0.0)))
+                * f64::from(effective_fade)
+                > f64::from(f32::MAX),
+        fade_sentinel: base_fade_sentinel || reference_fade_sentinel,
+        radius_offset_ignored,
+        // Fade is consumed. Other nonzero/invalid fields still require their own native path.
+        unsupported_reference_data: light.reference_data.as_ref().is_some_and(|data| {
+            [
+                data.fov_offset,
+                data.end_distance_cap,
+                data.shadow_depth_bias,
+            ]
+            .iter()
+            .any(|value| value.is_none_or(|value| value != 0.0))
+        }),
+        malformed_reference_data,
+        unsupported_falloff: shadow_mode,
+        suppressed_flags: light.flags & (LIGHT_FLAG_NEGATIVE | LIGHT_FLAG_OFF_BY_DEFAULT) != 0,
+        transform: LIGHT_TRANSFORM,
+    }
+}
+
+/// Cumulative spawn-time coverage, including references with no emitted PointLight.
+/// Counts are dispositions, not mutually exclusive; unload/reload counts a new evaluation.
+#[derive(Resource, Default, Debug)]
+pub struct LightInputCoverage {
+    pub evaluated: u64,
+    pub legacy_normalization: u64,
+    pub legacy_fade: u64,
+    pub reference_fade_applied: u64,
+    pub invalid_reference_fade: u64,
+    pub native_radius_fallback: u64,
+    pub invalid_fade: u64,
+    pub invalid_radius: u64,
+    pub backend_limited: u64,
+    pub unsupported_reference_data: u64,
+    pub malformed_reference_data: u64,
+    pub unsupported_falloff: u64,
+    pub suppressed_flags: u64,
+}
+
+fn record_light_coverage(
+    lights: Query<&LightEvaluation, Added<LightEvaluation>>,
+    mut coverage: ResMut<LightInputCoverage>,
+) {
+    for light in &lights {
+        coverage.evaluated += 1;
+        coverage.legacy_normalization += 1;
+        coverage.legacy_fade += u64::from(light.legacy_fade);
+        coverage.reference_fade_applied += u64::from(light.reference_fade_applied);
+        coverage.invalid_reference_fade += u64::from(light.invalid_reference_fade);
+        coverage.native_radius_fallback += u64::from(light.native_radius_fallback);
+        coverage.invalid_fade += u64::from(light.invalid_fade);
+        coverage.invalid_radius += u64::from(light.invalid_radius);
+        coverage.backend_limited += u64::from(light.backend_limited);
+        coverage.unsupported_reference_data += u64::from(light.unsupported_reference_data);
+        coverage.malformed_reference_data += u64::from(light.malformed_reference_data);
+        coverage.unsupported_falloff += u64::from(light.unsupported_falloff);
+        coverage.suppressed_flags += u64::from(light.suppressed_flags);
+    }
+    if !lights.is_empty() {
+        debug!(?coverage, "local light input coverage (cumulative)");
+    }
+}
 
 /// How many of the spawned lights are enabled at once. Bevy's clustered forward renderer draws
 /// every enabled light in a cluster it reaches, and the game's spaces hold whole halls of `LIGH`
@@ -178,67 +287,34 @@ pub const ENABLED_LIGHT_BUDGET: usize = 64;
 /// every spawned light, so it is not done per frame.
 pub const BUDGET_RECHOOSE_DISTANCE: f32 = 256.0;
 
-/// The Bevy light a `LIGH` row becomes, or `None` for a record the engine must not light the world
-/// with: a negative light ([`LIGHT_FLAG_NEGATIVE`]), one that is off by default
-/// ([`LIGHT_FLAG_OFF_BY_DEFAULT`]), or one whose effective radius is not a positive, finite number
-/// of Creation units.
-///
-/// `radius_override` is the reference's `XRDS` radius when it carries one; see [`radius_of`].
-///
-/// The colour is the record's RGB in the byte order the converter read it - `DATA`'s colour bytes
-/// as sRGB, the way the engine treats every other colour of the game.
-pub fn point_light(light: &LightRow, radius_override: Option<f32>) -> Option<PointLight> {
-    if light.flags & (LIGHT_FLAG_NEGATIVE | LIGHT_FLAG_OFF_BY_DEFAULT) != 0 {
-        return None;
-    }
-    let radius = radius_of(light, radius_override)?;
-    Some(PointLight {
-        color: Color::srgb_u8(light.color[0], light.color[1], light.color[2]),
-        intensity: intensity_for_radius(radius),
-        range: radius,
-        shadow_maps_enabled: false,
-        ..default()
-    })
+/// Convenience entrypoint; streaming also retains the evaluation on the reference entity.
+pub fn point_light(light: &LightRow, radius_offset: Option<f32>) -> Option<PointLight> {
+    evaluate_light(light, radius_offset).point_light()
 }
 
-/// The radius a reference lights its space with.
-///
-/// `LIGH` records share their radius, and a reference places the same light at wildly different
-/// sizes: 10,810 of the 12,148 `LIGH` references in `Skyrim.esm` carry an `XRDS` radius of their
-/// own, and one placed candle is 850.8 units where another is 147.7. The reference's override
-/// therefore wins over the record, and the record's own radius is the fallback.
-///
-/// An override that is not a positive, finite number is not used: `XRDS` has been seen negative,
-/// and a radius is a size, not a switch - the flags carry the light's on/off state - so a nonsense
-/// override leaves the record's radius in place instead of leaving the room dark. Neither is one
-/// above [`MAX_RADIUS_OVERRIDE`].
-fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
-    let usable = |radius: f32| (radius.is_finite() && radius > 0.0).then_some(radius);
-    radius_override
-        .filter(|&radius| radius <= MAX_RADIUS_OVERRIDE)
-        .and_then(usable)
-        .or_else(|| usable(light.radius))
-}
-
-/// The largest `XRDS` radius a reference may give its light, in Creation units: two exterior
-/// cells. A larger override is ignored and the record's own radius is used.
-///
-/// Across the base game's and the official add-ons' plugins, 13,677 of 15,167 `LIGH` references
-/// carry an override. The largest `LIGH` record radius is 2,000; the positive overrides run
-/// smoothly up to 6,919, and then jump: the nine above that are 15,967, four of 25,074, 456,444,
-/// two of 844,567 and 3,736,737. Taken as a light's range, those reach across many cells (the
-/// largest across the whole map) and put the light into every cluster of the view, while its
-/// brightness is capped anyway ([`INTENSITY_REFERENCE_RADIUS`]). 8,192 sits in the gap.
+/// Maximum backend range for a base radius or an additive XRDS result. An in-range sum is clamped
+/// to this cap and its authored value kept on `LightEvaluation`. A finite XRDS offset above the cap
+/// is a retail outlier and is ignored, so the light keeps its base radius (see `evaluate_light`).
 pub const MAX_RADIUS_OVERRIDE: f32 = 8_192.0;
 
-/// The intensity a `LIGH` radius is lit with; see the module documentation for the derivation.
-///
-/// The reference distance is the light's own half radius up to [`INTENSITY_REFERENCE_RADIUS`] and
-/// that cap above it, so a big light keeps its reach without a brightness that grows with the
-/// square of the radius it is only meant to reach. Every radius up to twice the cap is unchanged.
+/// Native 1.7.104 CreatePointLight, RVA 0x2746d2; not an editor hint or arbitrary range knob.
+pub const NATIVE_NONPOSITIVE_RADIUS: f32 = 0.1;
+/// Native constructor dispatches DATA falloff only for spot/hemi/omni shadow modes.
+pub const LIGHT_FLAG_SHADOW_MODES: u32 = 0x1c00;
+
+/// Bounded compatibility lumens for unit fade. The normalization is frozen at b5259d33 and is
+/// not a native calibration. Bevy divides lumens by 4*PI; the diffuse BRDF adds another 1/PI.
 pub fn intensity_for_radius(radius: f32) -> f32 {
+    if !radius.is_finite() || radius <= 0.0 {
+        return 0.0;
+    }
     let reference = (radius * 0.5).min(INTENSITY_REFERENCE_RADIUS);
-    HALF_RADIUS_ILLUMINANCE * reference * reference / HALF_RADIUS_WINDOW
+    4.0 * core::f32::consts::PI
+        * core::f32::consts::PI
+        * LEGACY_HALF_RADIUS_RADIANCE
+        * reference
+        * reference
+        / HALF_RADIUS_WINDOW
 }
 
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.
@@ -267,10 +343,36 @@ struct LightBudget {
     /// cell streaming in or out, both move lights in or out of it. A cache keyed on the *count*
     /// alone kept a room walked into and stopped in dark until the player moved another
     /// [`BUDGET_RECHOOSE_DISTANCE`].
-    chosen: HashSet<Entity>,
+    chosen: HashMap<Entity, LightBudgetClass>,
 }
 
-/// Keeps the number of enabled [`SkyrimLight`]s to [`ENABLED_LIGHT_BUDGET`] nearest the camera.
+/// Backend budget policy only. Keep native fallback ranges and authored zero power intact,
+/// but do not let them displace wider emitting lights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LightBudgetClass {
+    Regular,
+    Tiny,
+    Dark,
+}
+
+impl LightBudgetClass {
+    fn of(light: &PointLight) -> Self {
+        if !light.intensity.is_finite()
+            || light.intensity <= 0.0
+            || !light.range.is_finite()
+            || light.range <= 0.0
+        {
+            Self::Dark
+        } else if light.range <= NATIVE_NONPOSITIVE_RADIUS {
+            Self::Tiny
+        } else {
+            Self::Regular
+        }
+    }
+}
+
+/// Applies the configured light budget, preferring wider emitters before tiny ones and excluding
+/// zero-power lights. The default limit is [`ENABLED_LIGHT_BUDGET`].
 ///
 /// Add it after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
 pub struct LightsPlugin;
@@ -308,6 +410,8 @@ fn activate_deferred_lights(
 impl Plugin for LightsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightBudget>()
+            .init_resource::<LightInputCoverage>()
+            .add_systems(Update, record_light_coverage)
             .add_systems(
                 Update,
                 activate_deferred_lights.after(crate::settings_ui::SettingsUiSet),
@@ -316,7 +420,8 @@ impl Plugin for LightsPlugin {
     }
 }
 
-/// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera, and hides the rest.
+/// Enables emitting lights up to the configured budget and hides the rest. Wider lights precede
+/// tiny lights; camera distance orders each class.
 ///
 /// Hidden is the switch: the lights are extracted to the render world only while they are visible
 /// (`bevy_pbr/src/render/light.rs`), and a light set back to `Visibility::Inherited` still goes
@@ -362,8 +467,9 @@ fn budget_lights(
         return;
     };
     let camera_position = camera.translation();
-    // One pass over every spawned light, allocating nothing: how many there are, and whether any of
-    // them is not in the set the current selection was made from.
+    // One pass over every spawned light, allocating nothing: count them and detect changed
+    // membership or budget class. A light that starts emitting must be reconsidered even when
+    // the entity set and camera do not change.
     //
     // The second half is what the count alone cannot answer. A swap that keeps the number of lights
     // in the world the same is invisible to a count - a cell unloading as another streams in with
@@ -371,9 +477,9 @@ fn budget_lights(
     // walked into and stopped in has to light up.
     let mut spawned = 0usize;
     let mut joined = false;
-    for (entity, _, _, _) in lights.iter() {
+    for (entity, _, light, _) in lights.iter() {
         spawned += 1;
-        joined |= !budget.chosen.contains(&entity);
+        joined |= budget.chosen.get(&entity) != Some(&LightBudgetClass::of(light));
     }
     if !joined
         && let Some(chosen_at) = budget.chosen_at
@@ -383,24 +489,26 @@ fn budget_lights(
         return;
     }
 
-    let mut ranked: Vec<(Entity, f32)> = lights
+    let mut ranked: Vec<(Entity, LightBudgetClass, f32)> = lights
         .iter()
-        .map(|(entity, transform, _, _)| {
+        .map(|(entity, transform, light, _)| {
             (
                 entity,
+                LightBudgetClass::of(light),
                 transform.translation().distance_squared(camera_position),
             )
         })
         .collect();
-    sort_by_distance(&mut ranked);
+    sort_for_budget(&mut ranked);
     let enabled: HashSet<Entity> = ranked
         .iter()
+        .filter(|(_, class, _)| *class != LightBudgetClass::Dark)
         .take(
             settings
                 .as_deref()
                 .map_or(ENABLED_LIGHT_BUDGET, |settings| settings.point_light_budget),
         )
-        .map(|(entity, _)| *entity)
+        .map(|(entity, _, _)| *entity)
         .collect();
 
     for (entity, _, _, mut visibility) in &mut lights {
@@ -414,8 +522,13 @@ fn budget_lights(
         }
     }
     budget.chosen_at = Some(camera_position);
-    budget.chosen = ranked.iter().map(|(entity, _)| *entity).collect();
-    if let Some((nearest, distance_squared)) = ranked.first()
+    budget.chosen = ranked
+        .iter()
+        .map(|(entity, class, _)| (*entity, *class))
+        .collect();
+    if let Some((nearest, _, distance_squared)) = ranked
+        .iter()
+        .find(|(_, class, _)| *class != LightBudgetClass::Dark)
         && let Ok((_, _, light, _)) = lights.get(*nearest)
     {
         debug!(
@@ -429,13 +542,17 @@ fn budget_lights(
     }
 }
 
-/// Nearest first. The entity breaks ties, so two lights at the same distance are chosen between the
-/// same way every frame they are re-ranked in.
-fn sort_by_distance(ranked: &mut [(Entity, f32)]) {
-    ranked.sort_by(|(left_entity, left), (right_entity, right)| {
-        left.total_cmp(right)
-            .then_with(|| left_entity.cmp(right_entity))
-    });
+/// Wider emitting lights precede tiny lights. Distance orders each class, and entity identity
+/// breaks ties. Dark lights stay in the cache but never consume an enabled slot.
+fn sort_for_budget(ranked: &mut [(Entity, LightBudgetClass, f32)]) {
+    ranked.sort_by(
+        |(left_entity, left_class, left), (right_entity, right_class, right)| {
+            left_class
+                .cmp(right_class)
+                .then_with(|| left.total_cmp(right))
+                .then_with(|| left_entity.cmp(right_entity))
+        },
+    );
 }
 
 #[cfg(test)]
@@ -500,6 +617,11 @@ mod tests {
             radius,
             color: [255, 200, 120],
             flags,
+            fade: None,
+            fade_status: None,
+            falloff: None,
+            reference_data: None,
+            radius_status: None,
         }
     }
 
@@ -540,53 +662,12 @@ mod tests {
         0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue
     }
 
-    /// Input-level consistency check, not rendered parity. The ambient of `crate::app` is stated as
-    /// `brightness` in this scale; a converted light's `illuminance` is computed in the same units
-    /// (its colour is taken out of the formula, so the scale stays colour-free). This checks that the
-    /// configured intensity scale states [`LIGHT_EXPOSURE`] times `AMBIENT_ILLUMINANCE` at half a
-    /// light's radius, so it catches a wrong formula in the input scale. It does not validate the
-    /// rendered surface brightness, which Bevy's ambient and specular paths determine.
-    ///
-    /// Above [`INTENSITY_REFERENCE_RADIUS`] that stops being true on purpose: a light bigger than
-    /// twice the cap is lit like the largest calibrated one, so what reaches a surface at half its
-    /// own reach falls off with the square of its radius. The reach is what a big radius buys.
     #[test]
-    fn a_light_lights_a_surface_at_half_its_radius_like_the_ambient_does() {
-        let wanted = LIGHT_EXPOSURE * AMBIENT_ILLUMINANCE;
-        for radius in [128.0, 512.0] {
-            let light = point_light(&light_row(radius, 0), None).unwrap();
-            let from_light = illuminance(&light, radius * 0.5);
-            assert!(
-                (from_light - wanted).abs() < wanted * 1.0e-3,
-                "a {radius}-unit light gives {from_light} at half its radius; {LIGHT_EXPOSURE} \
-                 times the ambient brightness of the world path is {wanted}"
-            );
-        }
-        // (512/radius)^2 of the 512-unit light, at that light's own half radius.
-        let torch = illuminance(&point_light(&light_row(512.0, 0), None).unwrap(), 256.0);
-        for radius in [1024.0, 4334.0] {
-            let light = point_light(&light_row(radius, 0), None).unwrap();
-            let from_light = illuminance(&light, radius * 0.5);
-            let spread = (512.0 / radius).powi(2);
-            assert!(
-                (from_light - torch * spread).abs() < wanted * 1.0e-3,
-                "a {radius}-unit light gives {from_light} at half its radius; a torch's own \
-                 intensity spread over that reach gives {}",
-                torch * spread
-            );
-        }
-        assert!(
-            (HALF_RADIUS_ILLUMINANCE
-                - 4.0
-                    * core::f32::consts::PI
-                    * core::f32::consts::PI
-                    * AMBIENT_ILLUMINANCE
-                    * LIGHT_EXPOSURE)
-                .abs()
-                < 1.0,
-            "the target illuminance is 4*PI^2 times the ambient the world path applies times \
-             LIGHT_EXPOSURE, got {HALF_RADIUS_ILLUMINANCE}"
-        );
+    fn compatibility_normalization_is_frozen_independently_of_environment_policy() {
+        // Baseline b5259d33: independent numeric regression oracle, not the ambient constant.
+        let light = point_light(&light_row(512.0, 0), None).unwrap();
+        assert!((light.intensity / 40_157_850_311.0 - 1.0).abs() < 1e-6);
+        assert!((illuminance(&light, 256.0) / 13_641.851 - 1.0).abs() < 1e-6);
     }
 
     /// The scale is per radius, so the surface brightness at half a light's radius does not depend
@@ -641,7 +722,10 @@ mod tests {
     fn the_reference_cap_leaves_every_radius_up_to_512_exactly_as_it_was() {
         let uncapped = |radius: f32| {
             let half_radius = radius * 0.5;
-            HALF_RADIUS_ILLUMINANCE * half_radius * half_radius / HALF_RADIUS_WINDOW
+            (4.0 * core::f32::consts::PI * core::f32::consts::PI * LEGACY_HALF_RADIUS_RADIANCE)
+                * half_radius
+                * half_radius
+                / HALF_RADIUS_WINDOW
         };
         for radius in [0.5, 64.0, 128.0, 147.7, 256.0, 330.0, 511.0, 512.0] {
             assert_eq!(
@@ -676,6 +760,7 @@ mod tests {
             radius: 4334.0,
             color: [216, 128, 39],
             flags: 0,
+            ..light_row(4334.0, 0)
         };
         let big = point_light(&falmer_city_light, None).unwrap();
         let torch = point_light(&light_row(512.0, 0), None).unwrap();
@@ -719,54 +804,152 @@ mod tests {
         assert!(point_light(&light_row(512.0, LIGHT_FLAG_NEGATIVE), None).is_none());
         assert!(point_light(&light_row(512.0, LIGHT_FLAG_OFF_BY_DEFAULT), None).is_none());
         assert!(point_light(&light_row(512.0, 0x0001 | 0x0008), None).is_some());
-        assert!(
-            point_light(&light_row(0.0, 0), None).is_none(),
-            "a light with no radius lights nothing"
-        );
+        assert_eq!(point_light(&light_row(0.0, 0), None).unwrap().range, 0.1);
         assert!(point_light(&light_row(f32::NAN, 0), None).is_none());
-        assert!(point_light(&light_row(-64.0, 0), None).is_none());
+        assert_eq!(point_light(&light_row(-64.0, 0), None).unwrap().range, 0.1);
         assert!(
             point_light(&light_row(0.0, 0), Some(512.0)).is_some(),
             "an override rescues a record whose own radius is unusable"
         );
     }
 
-    /// The reference's `XRDS` radius replaces the record's, and the intensity scale has to follow
-    /// it: most `LIGH` references carry one (10,810 of the 12,148 in `Skyrim.esm`), and using the
-    /// record default would light them at the wrong size.
+    /// Signed XRDS adds to the base radius; negative offsets shrink rather than disable it.
     #[test]
-    fn a_reference_radius_override_replaces_the_record_radius() {
+    fn a_reference_radius_offset_adds_to_the_record_radius() {
         let record = light_row(256.0, 0);
         let overridden = point_light(&record, Some(850.8)).unwrap();
-        assert_eq!(overridden.range, 850.8);
+        assert_eq!(overridden.range, 1106.8);
         assert!(
-            (overridden.intensity / intensity_for_radius(850.8) - 1.0).abs() < 1.0e-5,
+            (overridden.intensity / intensity_for_radius(1106.8) - 1.0).abs() < 1.0e-5,
             "the intensity follows the radius that is used: {}",
             overridden.intensity
         );
 
-        // A nonsense override is not a switch: the record's own radius stands.
-        for override_radius in [-100.0, 0.0, f32::NAN, f32::INFINITY] {
-            let light = point_light(&record, Some(override_radius)).unwrap();
-            assert_eq!(light.range, 256.0, "override {override_radius}");
+        assert_eq!(point_light(&record, Some(-100.0)).unwrap().range, 156.0);
+        assert_eq!(point_light(&record, Some(0.0)).unwrap().range, 256.0);
+        for offset in [-256.0, -300.0] {
+            assert_eq!(point_light(&record, Some(offset)).unwrap().range, 0.1);
+        }
+        for offset in [f32::NAN, f32::INFINITY] {
+            assert!(point_light(&record, Some(offset)).is_none());
         }
     }
 
-    /// The outliers the base game carries (15,967 up to 3,736,737 units) fall back to the record's
-    /// radius; the largest ordinary override (6,919) and the cap itself are kept.
+    /// A large radius or an in-range offset whose sum passes the cap is clamped to the cap, with the
+    /// authored sum kept. An offset above the cap is a retail outlier and is ignored instead.
     #[test]
-    fn an_override_above_the_cap_is_ignored() {
-        let record = light_row(256.0, 0);
-        for kept in [6_919.0, MAX_RADIUS_OVERRIDE] {
-            assert_eq!(point_light(&record, Some(kept)).unwrap().range, kept);
+    fn backend_range_limit_clamps_a_large_sum_but_ignores_an_outlier_offset() {
+        assert_eq!(
+            point_light(&light_row(20_000.0, 0), None).unwrap().range,
+            MAX_RADIUS_OVERRIDE
+        );
+        let sum = evaluate_light(&light_row(2_000.0, 0), Some(7_000.0));
+        assert_eq!(sum.authored_radius, Some(9_000.0));
+        assert_eq!(sum.point_light().unwrap().range, MAX_RADIUS_OVERRIDE);
+        assert!(sum.backend_limited && !sum.radius_offset_ignored);
+        // The cap itself is an offset that is kept, not an outlier.
+        let at_cap = evaluate_light(&light_row(256.0, 0), Some(MAX_RADIUS_OVERRIDE));
+        assert!(!at_cap.radius_offset_ignored);
+        assert_eq!(at_cap.point_light().unwrap().range, MAX_RADIUS_OVERRIDE);
+
+        // The ten references above the cap in the registered pack (nine retail, 15,967 up to
+        // 3,736,737 units, and one Creation Club, 9,505.58) keep the record's radius, as before
+        // XRDS became additive; they do not jump to the range cap.
+        let unit = point_light(&light_row(256.0, 0), None).unwrap();
+        for outlier in [
+            9_505.58,
+            15_967.0,
+            25_074.0,
+            456_444.0,
+            844_567.0,
+            3_736_737.5,
+        ] {
+            let evaluated = evaluate_light(&light_row(256.0, 0), Some(outlier));
+            assert_eq!(evaluated.radius_offset, Some(outlier), "raw offset is kept");
+            assert_eq!(evaluated.authored_radius, Some(256.0), "offset {outlier}");
+            assert!(evaluated.radius_offset_ignored && evaluated.backend_limited);
+            let light = evaluated.point_light().unwrap();
+            assert_eq!(light.range, 256.0, "offset {outlier}");
+            assert_eq!(light.intensity, unit.intensity, "offset {outlier}");
         }
-        for outlier in [15_967.0, 25_074.0, 3_736_737.5] {
-            assert_eq!(
-                point_light(&record, Some(outlier)).unwrap().range,
-                256.0,
-                "override {outlier}"
-            );
+        // An unusable record radius is not rescued by an ignored outlier.
+        assert_eq!(
+            evaluate_light(&light_row(0.0, 0), Some(25_074.0))
+                .point_light()
+                .unwrap()
+                .range,
+            NATIVE_NONPOSITIVE_RADIUS
+        );
+        // A non-finite offset stays invalid rather than being treated as an outlier.
+        let infinite = evaluate_light(&light_row(256.0, 0), Some(f32::INFINITY));
+        assert!(infinite.invalid_radius && !infinite.radius_offset_ignored);
+    }
+
+    fn reference_light_data(fade_offset: Option<f32>) -> crate::world::database::ReferenceLightRow {
+        crate::world::database::ReferenceLightRow {
+            data_size: 16,
+            fov_offset: Some(0.0),
+            fade_offset,
+            end_distance_cap: Some(0.0),
+            shadow_depth_bias: Some(0.0),
         }
+    }
+
+    /// `f32::MAX` in FNAM or XLIG is the "no fade" sentinel. It must not become a light at
+    /// maximum intensity: it leaves the unit fade (or the authored base fade) in place.
+    #[test]
+    fn the_max_fade_sentinel_means_no_fade_and_never_a_maximum_light() {
+        let unit = point_light(&light_row(256.0, 0), None).unwrap();
+
+        // Absent fade is also "no fade": unit power, no sentinel disposition.
+        let absent = evaluate_light(&light_row(256.0, 0), None);
+        assert_eq!(absent.effective_fade, 1.0);
+        assert!(!absent.fade_sentinel);
+
+        // FNAM sentinel alone.
+        let mut row = light_row(256.0, 0);
+        row.fade = Some(f32::MAX);
+        row.fade_status = Some(1);
+        let evaluated = evaluate_light(&row, None);
+        assert!(evaluated.fade_sentinel && evaluated.legacy_fade && !evaluated.invalid_fade);
+        assert_eq!(evaluated.base_fade, 1.0);
+        assert_eq!(evaluated.effective_fade, 1.0);
+        assert_eq!(evaluated.authored_fade, 1.0);
+        assert!(!evaluated.backend_limited);
+        assert_eq!(evaluated.point_light().unwrap().intensity, unit.intensity);
+
+        // XLIG sentinel keeps the authored base fade and is neither applied nor malformed.
+        let mut row = light_row(256.0, 0);
+        row.fade = Some(2.0);
+        row.fade_status = Some(1);
+        row.reference_data = Some(reference_light_data(Some(f32::MAX)));
+        let evaluated = evaluate_light(&row, None);
+        assert!(evaluated.fade_sentinel);
+        assert!(!evaluated.reference_fade_applied && !evaluated.invalid_reference_fade);
+        assert!(!evaluated.malformed_reference_data && !evaluated.unsupported_reference_data);
+        assert_eq!(evaluated.authored_fade, 2.0);
+        assert_eq!(evaluated.effective_fade, 2.0);
+        assert!(!evaluated.backend_limited);
+        let light = evaluated.point_light().unwrap();
+        assert!((light.intensity / unit.intensity - 2.0).abs() < 1.0e-5);
+        assert_ne!(light.intensity, f32::MAX);
+
+        // Both sentinels together leave unit power.
+        row.fade = Some(f32::MAX);
+        let evaluated = evaluate_light(&row, None);
+        assert!(evaluated.fade_sentinel);
+        assert_eq!(evaluated.effective_fade, 1.0);
+        assert_eq!(evaluated.point_light().unwrap().intensity, unit.intensity);
+
+        // A near-sentinel finite offset is an ordinary offset, not the sentinel.
+        let mut row = light_row(256.0, 0);
+        row.reference_data = Some(reference_light_data(Some(f32::MAX / 2.0)));
+        let evaluated = evaluate_light(&row, None);
+        assert!(!evaluated.fade_sentinel && evaluated.reference_fade_applied);
+        assert!(
+            evaluated.backend_limited,
+            "the saturated product is flagged"
+        );
     }
 
     /// A light budgeted around a camera, as `budget_lights` sees them.
@@ -813,6 +996,119 @@ mod tests {
                 *app.world().entity(*entity).get::<Visibility>().unwrap() == Visibility::Inherited
             })
             .collect()
+    }
+
+    #[test]
+    fn tiny_fallback_and_zero_power_lights_do_not_displace_wider_lights() {
+        let mut app = budget_app(
+            Vec3::ZERO,
+            (0..ENABLED_LIGHT_BUDGET).map(|i| Vec3::new(1000.0 + i as f32, 0.0, 0.0)),
+        );
+        let regular: HashSet<_> = enabled_lights(&mut app).into_iter().collect();
+        let mut tiny = HashSet::new();
+        let mut dark = HashSet::new();
+        for _ in 0..ENABLED_LIGHT_BUDGET + 1 {
+            tiny.insert(
+                app.world_mut()
+                    .spawn((
+                        SkyrimLight {
+                            form_id: 3,
+                            cell_id: 4,
+                        },
+                        point_light(&light_row(0.0, 0), None).unwrap(),
+                        Transform::default(),
+                    ))
+                    .id(),
+            );
+            dark.insert(
+                app.world_mut()
+                    .spawn((
+                        SkyrimLight {
+                            form_id: 5,
+                            cell_id: 4,
+                        },
+                        point_light(
+                            &LightRow {
+                                fade: Some(0.0),
+                                fade_status: Some(1),
+                                ..light_row(512.0, 0)
+                            },
+                            None,
+                        )
+                        .unwrap(),
+                        Transform::default(),
+                    ))
+                    .id(),
+            );
+        }
+        app.update();
+        let enabled = enabled_lights(&mut app);
+        assert_eq!(enabled.len(), ENABLED_LIGHT_BUDGET);
+        assert!(enabled.iter().all(|entity| regular.contains(entity)));
+
+        // Keep the native 0.1 light and permit it when a slot is available.
+        app.world_mut()
+            .entity_mut(*regular.iter().next().unwrap())
+            .despawn();
+        app.update();
+        let enabled = enabled_lights(&mut app);
+        assert_eq!(enabled.len(), ENABLED_LIGHT_BUDGET);
+        assert_eq!(
+            enabled
+                .iter()
+                .filter(|entity| tiny.contains(*entity))
+                .count(),
+            1
+        );
+        assert!(enabled.iter().all(|entity| !dark.contains(entity)));
+    }
+
+    #[test]
+    fn the_budget_reconsiders_power_and_range_class_changes_without_camera_motion() {
+        let mut app = budget_app(
+            Vec3::ZERO,
+            (0..ENABLED_LIGHT_BUDGET).map(|i| Vec3::new(1000.0 + i as f32, 0.0, 0.0)),
+        );
+        let regular: HashSet<_> = enabled_lights(&mut app).into_iter().collect();
+        let changed = app
+            .world_mut()
+            .spawn((
+                SkyrimLight {
+                    form_id: 3,
+                    cell_id: 4,
+                },
+                point_light(
+                    &LightRow {
+                        fade: Some(0.0),
+                        fade_status: Some(1),
+                        ..light_row(512.0, 0)
+                    },
+                    None,
+                )
+                .unwrap(),
+                Transform::default(),
+            ))
+            .id();
+        app.update();
+        assert!(!enabled_lights(&mut app).contains(&changed));
+
+        app.world_mut()
+            .get_mut::<PointLight>(changed)
+            .unwrap()
+            .intensity = intensity_for_radius(512.0);
+        app.update();
+        let enabled = enabled_lights(&mut app);
+        assert_eq!(enabled.len(), ENABLED_LIGHT_BUDGET);
+        assert!(enabled.contains(&changed));
+
+        app.world_mut()
+            .get_mut::<PointLight>(changed)
+            .unwrap()
+            .range = NATIVE_NONPOSITIVE_RADIUS;
+        app.update();
+        let enabled = enabled_lights(&mut app);
+        assert_eq!(enabled.len(), ENABLED_LIGHT_BUDGET);
+        assert!(enabled.iter().all(|entity| regular.contains(entity)));
     }
 
     fn move_camera(app: &mut App, camera: Vec3) {
