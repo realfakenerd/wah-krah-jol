@@ -2,7 +2,8 @@
 
 use bevy::{
     app::Plugin,
-    prelude::{App, Res, Resource, Startup},
+    light::cluster::GlobalClusterSettings,
+    prelude::{App, PreStartup, Res, ResMut, Resource, Startup},
     render::{
         RenderPlugin,
         renderer::{RenderAdapterInfo, RenderDevice},
@@ -20,7 +21,7 @@ pub struct RendererInitPlugin(WgpuSettings);
 impl Plugin for RendererInitPlugin {
     /// Adds `RenderPlugin`, initialized manually when DX12 may be selected.
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, log_renderer_policy);
+        install_renderer_policy(app);
 
         #[cfg(not(target_os = "windows"))]
         {
@@ -67,6 +68,37 @@ impl Plugin for RendererInitPlugin {
                 ..Default::default()
             });
         }
+    }
+}
+
+/// Applies backend safety policy after PbrPlugin::finish supplies cluster settings,
+/// before the first Startup, light assignment and render-world extraction.
+fn install_renderer_policy(app: &mut App) {
+    app.add_systems(PreStartup, configure_clustering_policy)
+        .add_systems(Startup, log_renderer_policy);
+}
+
+/// Bypasses the pinned Bevy GPU clustering shaders with unchecked array accesses.
+fn configure_clustering_policy(
+    adapter: Option<Res<RenderAdapterInfo>>,
+    settings: Option<ResMut<GlobalClusterSettings>>,
+) {
+    let (Some(adapter), Some(mut settings)) = (adapter, settings) else {
+        return;
+    };
+    if adapter.backend == wgpu::Backend::Metal && settings.gpu_clustering.is_some() {
+        settings.gpu_clustering = None;
+        // Bevy 0.19's global allocation pass accesses partial 256-lane tails,
+        // and its raster pass can read past an overflowing Z-slice list. Use
+        // Bevy's supported CPU assignment path on Metal, retaining storage
+        // buffers, lights and shadows. Recheck before enabling GPU clustering
+        // on this backend; increasing initial capacity fixes neither contract.
+        // This avoids those hazards, but #467 still needs a matched native
+        // reproduction before attributing its firmware lockup to clustering.
+        // Reuses PR #253's CPU selection without its other renderer tuning.
+        bevy::log::info!(
+            "Metal clustering policy: CPU assignment enabled (GPU bounds safety workaround; #467)"
+        );
     }
 }
 
@@ -450,6 +482,142 @@ mod tests {
                     .contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
             );
         });
+    }
+
+    fn cluster_settings() -> bevy::light::cluster::GlobalClusterSettings {
+        use bevy::light::cluster::{GlobalClusterGpuSettings, GlobalClusterSettings};
+        GlobalClusterSettings {
+            supports_storage_buffers: true,
+            clustered_decals_are_usable: true,
+            gpu_clustering: Some(GlobalClusterGpuSettings {
+                initial_z_slice_list_capacity: 1024,
+                initial_index_list_capacity: 16384,
+            }),
+            max_uniform_buffer_clusterable_objects: 64,
+            view_cluster_bindings_max_indices: 16384,
+        }
+    }
+
+    // Synthetic metadata exercises actual backend selection without requesting
+    // a GPU, opening a window or changing the user's settings.
+    fn adapter_info(backend: Backend) -> bevy::render::renderer::RenderAdapterInfo {
+        use bevy::render::renderer::{RenderAdapterInfo, WgpuWrapper};
+        RenderAdapterInfo(WgpuWrapper::new(wgpu::AdapterInfo {
+            name: "policy-test".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::Other,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            subgroup_min_size: 1,
+            subgroup_max_size: 1,
+            transient_saves_memory: false,
+        }))
+    }
+
+    #[test]
+    fn metal_selects_cpu_before_first_startup_and_preserves_light_state() {
+        use bevy::{light::cluster::GlobalClusterSettings, prelude::*};
+        let mut app = App::new();
+        app.insert_resource(adapter_info(Backend::Metal))
+            .insert_resource(cluster_settings());
+        super::install_renderer_policy(&mut app);
+        app.add_systems(Startup, |settings: Res<GlobalClusterSettings>| {
+            assert!(settings.gpu_clustering.is_none());
+        });
+        let light = app
+            .world_mut()
+            .spawn(PointLight {
+                shadow_maps_enabled: true,
+                intensity: 1234.0,
+                ..default()
+            })
+            .id();
+        app.update();
+        let settings = app.world().resource::<GlobalClusterSettings>();
+        assert!(settings.gpu_clustering.is_none());
+        assert!(settings.supports_storage_buffers);
+        assert!(settings.clustered_decals_are_usable);
+        assert_eq!(settings.max_uniform_buffer_clusterable_objects, 64);
+        assert_eq!(settings.view_cluster_bindings_max_indices, 16384);
+        let light = app.world().get::<PointLight>(light).unwrap();
+        assert!(light.shadow_maps_enabled);
+        assert_eq!(light.intensity, 1234.0);
+        // The policy remains safe on subsequent updates too.
+        app.update();
+        assert!(
+            app.world()
+                .resource::<GlobalClusterSettings>()
+                .gpu_clustering
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn non_metal_clustering_capabilities_and_explicit_cpu_selection_are_preserved() {
+        use bevy::{light::cluster::GlobalClusterSettings, prelude::*};
+        for backend in [
+            Backend::Vulkan,
+            Backend::Dx12,
+            Backend::Gl,
+            Backend::BrowserWebGpu,
+            Backend::Noop,
+        ] {
+            for cpu_selected in [false, true] {
+                let mut settings = cluster_settings();
+                if cpu_selected {
+                    settings.gpu_clustering = None;
+                }
+                let expected = format!("{settings:?}");
+                let mut app = App::new();
+                app.insert_resource(adapter_info(backend))
+                    .insert_resource(settings);
+                super::install_renderer_policy(&mut app);
+                app.update();
+                assert_eq!(
+                    format!("{:?}", app.world().resource::<GlobalClusterSettings>()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn renderer_policy_tolerates_headless_apps_and_already_selected_cpu_clustering() {
+        use bevy::{light::cluster::GlobalClusterSettings, prelude::*};
+        let mut headless = App::new();
+        headless.insert_resource(cluster_settings());
+        super::install_renderer_policy(&mut headless);
+        headless.update();
+        assert!(
+            headless
+                .world()
+                .resource::<GlobalClusterSettings>()
+                .gpu_clustering
+                .is_some()
+        );
+
+        let mut no_pbr = App::new();
+        no_pbr.insert_resource(adapter_info(Backend::Metal));
+        super::install_renderer_policy(&mut no_pbr);
+        no_pbr.update();
+        assert!(!no_pbr.world().contains_resource::<GlobalClusterSettings>());
+
+        let mut cpu = App::new();
+        let mut settings = cluster_settings();
+        settings.gpu_clustering = None;
+        cpu.insert_resource(adapter_info(Backend::Metal))
+            .insert_resource(settings);
+        super::install_renderer_policy(&mut cpu);
+        cpu.update();
+        assert!(
+            cpu.world()
+                .resource::<GlobalClusterSettings>()
+                .gpu_clustering
+                .is_none()
+        );
     }
 
     /// DX12 loses only `MULTI_DRAW_INDIRECT_COUNT`; every other feature is kept.
