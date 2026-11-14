@@ -17,7 +17,11 @@ use shared::collision::CollisionBody;
 use std::path::Path;
 
 #[cfg(test)]
+mod feel_measure;
+#[cfg(test)]
 mod stair_tests;
+#[cfg(test)]
+mod view_interpolation_tests;
 
 use crate::{
     console::{AppConsoleExt, ConsoleCommand, ConsoleState, console_closed},
@@ -549,6 +553,7 @@ impl Plugin for PlayerControlsPlugin {
             .init_resource::<MoveMode>()
             .init_resource::<WalkIntent>()
             .init_resource::<SprintLatch>()
+            .init_resource::<WalkViewPose>()
             .init_resource::<LookIntent>()
             .init_resource::<WalkEntryStatus>()
             .init_resource::<WalkSpawnHold>()
@@ -582,6 +587,14 @@ impl Plugin for PlayerControlsPlugin {
                     .run_if(crate::door_crossing::walk_physics_allowed)
                     .run_if(console_closed)
                     .before(PhysicsSet::SyncBackend),
+            )
+            // Not gated: the blend must follow the body through pauses, crossings and the console.
+            .add_systems(
+                FixedUpdate,
+                (
+                    walk_view_begin_tick.before(walk_movement_system),
+                    walk_view_end_tick.after(PhysicsSet::Writeback),
+                ),
             );
     }
 }
@@ -1911,11 +1924,89 @@ fn walk_step_rise(
     Some(lift)
 }
 
-/// Camera follows the capsule at eye height; yaw on body, pitch on view (V9).
+/// Body position at the previous and the latest fixed tick, used to show the WALK view between ticks.
+///
+/// Physics runs at 60 Hz and a display can run faster. A camera that follows the body only
+/// repeats its position on every frame that ran no tick: on 50% of frames at 120 Hz, 59% at 144 Hz
+/// and 75% at 240 Hz in the controller-feel measurements (`physics/feel_measure.rs`). The view now
+/// shows the point between the previous and the latest tick that matches how far the frame is into
+/// the next tick (`Time<Fixed>::overstep_fraction`).
+///
+/// This is presentation only. The body, its collision and every physics query keep the latest tick
+/// position, which stays the authoritative eye (see [`WalkViewPose::authoritative_eye`]). The view
+/// trails it by 0 to one tick, at most 16.7 ms. Look rotation is not interpolated, so turning has no
+/// added latency.
+///
+/// Behaviour source: the Mudcrab controller-feel report, which takes the idea of showing a blend of
+/// the last two tick poses from the spud re-audit (chasmlol/spud, MIT, used as a map). This code is
+/// written from that written description, not from spud source.
+#[derive(Debug, Clone, Copy, Default, Resource)]
+pub struct WalkViewPose {
+    previous: Vec3,
+    latest: Vec3,
+    valid: bool,
+}
+
+impl WalkViewPose {
+    fn snap(&mut self, position: Vec3) {
+        *self = Self {
+            previous: position,
+            latest: position,
+            valid: true,
+        };
+    }
+
+    /// Whether `body` is where the last tick left it. Anything else moved the body outside the
+    /// fixed tick (teleport, door arrival, origin rebase, entering WALK): show it where it is.
+    fn follows(&self, body: Vec3) -> bool {
+        self.valid && body == self.latest
+    }
+
+    fn shown(&self, fraction: f32) -> Vec3 {
+        self.previous.lerp(self.latest, fraction.clamp(0.0, 1.0))
+    }
+
+    /// The eye the physics and picking agree on: the latest tick, not the blended view.
+    pub fn authoritative_eye(&self, tuning: &MovementTuning) -> Option<Vec3> {
+        self.valid
+            .then(|| self.latest + Vec3::Y * tuning.eye_height)
+    }
+}
+
+/// Before a tick moves the body: drop a stale pose if something else moved the body since.
+fn walk_view_begin_tick(
+    mut pose: ResMut<WalkViewPose>,
+    player: Query<&Transform, (With<PlayerBody>, Without<StreamingCamera>)>,
+) {
+    let Ok(body) = player.single() else {
+        return;
+    };
+    if !pose.follows(body.translation) {
+        pose.snap(body.translation);
+    }
+}
+
+/// After physics wrote the body back: the latest tick becomes the end of the blend.
+fn walk_view_end_tick(
+    mut pose: ResMut<WalkViewPose>,
+    player: Query<&Transform, (With<PlayerBody>, Without<StreamingCamera>)>,
+) {
+    let Ok(body) = player.single() else {
+        return;
+    };
+    pose.previous = pose.latest;
+    pose.latest = body.translation;
+    pose.valid = true;
+}
+
+/// Camera follows the capsule at eye height; yaw on body, pitch on view (V9). The position is the
+/// blend of the last two ticks (see [`WalkViewPose`]); the rotation is immediate.
 pub fn walk_camera_follow_system(
     mode: Res<MoveMode>,
     tuning: Res<MovementTuning>,
     look: Res<LookIntent>,
+    fixed: Res<Time<Fixed>>,
+    mut pose: ResMut<WalkViewPose>,
     player: Query<&Transform, (With<PlayerBody>, Without<StreamingCamera>)>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
 ) {
@@ -1926,7 +2017,10 @@ pub fn walk_camera_follow_system(
         return;
     };
     let (yaw, _, _) = body.rotation.to_euler(EulerRot::YXZ);
-    view.translation = body.translation + Vec3::Y * tuning.eye_height;
+    if !pose.follows(body.translation) {
+        pose.snap(body.translation);
+    }
+    view.translation = pose.shown(fixed.overstep_fraction()) + Vec3::Y * tuning.eye_height;
     view.rotation = Quat::from_euler(EulerRot::YXZ, yaw, look.pitch, 0.0);
 }
 
@@ -3535,6 +3629,9 @@ fn pickup_root(
 fn world_tankard_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     capture: Res<CursorCapture>,
+    mode: Res<MoveMode>,
+    tuning: Res<MovementTuning>,
+    view_pose: Res<WalkViewPose>,
     camera: Query<&Transform, (With<StreamingCamera>, With<ControlledCamera>)>,
     terrain: Query<(), With<TerrainCollider>>,
     tankards: Query<(), With<DebugTankard>>,
@@ -3552,12 +3649,20 @@ fn world_tankard_input(
     let (Ok(camera), Ok(context)) = (camera.single(), context.single()) else {
         return;
     };
+    // Rays start at the authoritative eye (latest tick), not at the blended view, so picking
+    // does not depend on the display's refresh rate. In NOCLIP the camera is authoritative.
+    let eye = match *mode {
+        MoveMode::Walk => view_pose
+            .authoritative_eye(&tuning)
+            .unwrap_or(camera.translation),
+        _ => camera.translation,
+    };
     if keyboard.just_pressed(KeyCode::KeyT)
         && tankards.iter().count() < MAX_LIVE_TANKARDS
         && let Some(visuals) = visuals
     {
         let horizontal = camera.forward().as_vec3().with_y(0.0).normalize_or_zero();
-        let origin = camera.translation + horizontal * 140.0 + Vec3::Y * 300.0;
+        let origin = eye + horizontal * 140.0 + Vec3::Y * 300.0;
         let is_terrain = |entity| terrain.get(entity).is_ok();
         if let Some((_, distance)) = context.cast_ray(
             origin,
@@ -3597,13 +3702,7 @@ fn world_tankard_input(
         QueryFilter::default()
     };
     let selected = context
-        .cast_ray(
-            camera.translation,
-            camera.forward().as_vec3(),
-            240.0,
-            true,
-            filter,
-        )
+        .cast_ray(eye, camera.forward().as_vec3(), 240.0, true, filter)
         .and_then(|(entity, _)| pickup_root(entity, &parents, &interactables));
     if let Some(entity) = selected {
         commands
