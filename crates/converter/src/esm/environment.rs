@@ -504,9 +504,10 @@ pub(crate) fn insert_cell(
         }
     }
 
-    let xcll = view.find(b"XCLL").filter(|bytes| bytes.len() >= XCLL_MIN);
+    let authored_xcll = view.find(b"XCLL");
+    let xcll = authored_xcll.filter(|bytes| bytes.len() >= XCLL_MIN);
     let template = link(b"LTMP", &[b"LGTM"]);
-    if xcll.is_none() && template.is_none() {
+    if authored_xcll.is_none() && template.is_none() {
         tx.prepare_cached("DELETE FROM cell_lighting WHERE cell_id=?1")?
             .execute([cell_id])?;
         return Ok(());
@@ -515,7 +516,9 @@ pub(crate) fn insert_cell(
     Row::default()
         .put("cell_id", cell_id)
         .put("lighting_template_id", template)
-        .put("xcll_size", xcll.map(|bytes| bytes.len() as i64))
+        // Keep rejected block presence distinct from an LTMP-only cell. The runtime must
+        // not turn malformed local lighting into implicit inheritance of every group.
+        .put("xcll_size", authored_xcll.map(|bytes| bytes.len() as i64))
         .lighting(bytes)
         .put("inherit_flags", u32_at(bytes, 88))
         .insert(tx, "cell_lighting")

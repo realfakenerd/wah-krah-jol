@@ -106,8 +106,7 @@ fn plugin_checksum(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
 
 impl EsmParser {
     /// Export using the selected frontend, returning exactly the projection input.
-    #[cfg(test)]
-    pub(crate) fn convert_plugins_with_reader(
+    pub fn convert_plugins_with_reader(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,

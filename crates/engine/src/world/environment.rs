@@ -5,6 +5,9 @@
 //! optional: a database converted before them, or with a table of another shape, loads an empty
 //! map for that table and the engine keeps its built-in lighting. Nothing renders from this
 //! catalog yet; it is the reader later lighting and sky work consumes (#264).
+//! Interior runtime consumption now lives in [`interior`]; exterior weather selection remains open.
+
+pub(crate) mod interior;
 
 use bevy::prelude::*;
 use rusqlite::{Connection, OpenFlags, Row};
@@ -35,7 +38,7 @@ impl TimeOfDay {
 
 /// A directional ambient block (`DALC`): colours along X+, X-, Y+, Y-, Z+, and Z-.
 /// Specular colour and scale are optional. Colours are 8-bit sRGB.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
 pub struct DirectionalAmbient {
     pub colors: [[u8; 3]; 6],
     pub specular: Option<[u8; 3]>,
@@ -44,7 +47,7 @@ pub struct DirectionalAmbient {
 
 /// The lighting fields an `XCLL` and an `LGTM` `DATA` share. A field is `None` when the block is
 /// absent or too short to hold it. Colours are 8-bit sRGB; rotations are degrees, as authored.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
 pub struct Lighting {
     pub ambient: Option<[u8; 3]>,
     pub directional: Option<[u8; 3]>,
@@ -66,6 +69,8 @@ pub struct Lighting {
 /// A cell's `XCLL` lighting and `LTMP` template.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CellLighting {
+    /// Authored XCLL length, including rejected blocks under 72 bytes. None means absent.
+    pub xcll_size: Option<u32>,
     pub lighting_template: Option<u32>,
     pub lighting: Lighting,
     /// Which fields come from the lighting template instead (db-schema.md lists the bits).
@@ -151,6 +156,7 @@ pub struct ClimateWeather {
 #[derive(Resource, Debug, Default)]
 pub struct EnvironmentCatalog {
     cells: HashMap<u32, CellLighting>,
+    cell_flags: HashMap<u32, Option<u32>>,
     worldspaces: HashMap<u32, WorldspaceEnvironment>,
     templates: HashMap<u32, LightingTemplate>,
     weathers: HashMap<u32, Weather>,
@@ -246,7 +252,7 @@ impl EnvironmentCatalog {
         let cells = read(
             connection,
             &format!(
-                "SELECT cell_id, lighting_template_id, {}, inherit_flags FROM cell_lighting",
+                "SELECT cell_id, lighting_template_id, {}, inherit_flags, xcll_size FROM cell_lighting",
                 lighting_columns()
             ),
             "cell_lighting",
@@ -254,12 +260,19 @@ impl EnvironmentCatalog {
                 Ok((
                     row.get(0)?,
                     CellLighting {
+                        xcll_size: row.get(3 + LIGHTING_WIDTH)?,
                         lighting_template: row.get(1)?,
                         lighting: lighting(row, 2)?,
                         inherit_flags: row.get(2 + LIGHTING_WIDTH)?,
                     },
                 ))
             },
+        );
+        let cell_flags = read(
+            connection,
+            "SELECT cell_id, data_flags FROM cell_environment",
+            "cell_environment",
+            |row| Ok((row.get(0)?, row.get(1)?)),
         );
         let worldspaces = read(
             connection,
@@ -362,12 +375,18 @@ impl EnvironmentCatalog {
         );
         Self {
             cells,
+            cell_flags,
             worldspaces,
             templates,
             weathers,
             image_spaces,
             climate_weathers,
         }
+    }
+
+    /// CELL DATA flags, including independent Show Sky and Use Sky Lighting bits.
+    pub fn cell_flags(&self, cell_id: u32) -> Option<u32> {
+        self.cell_flags.get(&cell_id).copied().flatten()
     }
 
     /// The cell's authored lighting, or `None` when it has none or the database predates it.
@@ -489,7 +508,7 @@ fn read_rows<T>(
             .collect::<rusqlite::Result<Vec<_>>>()
     });
     rows.unwrap_or_else(|error| {
-        info!("environment: no usable `{table}` table ({error}); built-in lighting stays");
+        info!("environment: no usable `{table}` table ({error}); authored fields unavailable");
         Vec::new()
     })
 }

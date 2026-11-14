@@ -886,12 +886,14 @@ pub(crate) struct RenderSettingsTargets<'w, 's> {
                 (
                     &'static mut DirectionalLight,
                     &'static mut CascadeShadowConfig,
+                    Option<&'static crate::world::environment::interior::WorldEnvironmentLight>,
                 ),
             >,
             Query<'w, 's, (), Added<DirectionalLight>>,
         ),
     >,
     ambient: Option<ResMut<'w, GlobalAmbientLight>>,
+    scene_environment: Option<Res<'w, crate::world::environment::interior::SceneEnvironment>>,
     shadow_map: Option<ResMut<'w, DirectionalLightShadowMap>>,
     point_shadow_map: Option<ResMut<'w, PointLightShadowMap>>,
     upload: Option<ResMut<'w, RenderAssetBytesPerFrame>>,
@@ -1059,18 +1061,22 @@ pub(crate) fn apply_render_settings(
         commands.entity(entity).insert(MSAA_MODES[settings.msaa]);
         apply_camera_features(&mut commands, entity, &settings);
     }
-    for (mut light, mut cascades) in &mut targets.sun.p0() {
-        light.illuminance = if settings.sun {
-            settings.sun_illuminance
-        } else {
-            0.0
-        };
-        light.color = Color::srgb(
-            settings.sun_color[0],
-            settings.sun_color[1],
-            settings.sun_color[2],
-        );
-        light.shadow_maps_enabled = settings.sun && settings.shadows;
+    for (mut light, mut cascades, environment_light) in &mut targets.sun.p0() {
+        // The scene consumer applies environment lighting after Update. Preferences never
+        // overwrite authored interior RGB; fixture lights keep the existing direct controls.
+        if environment_light.is_none() || targets.scene_environment.is_none() {
+            light.illuminance = if settings.sun {
+                settings.sun_illuminance
+            } else {
+                0.0
+            };
+            light.color = Color::srgb(
+                settings.sun_color[0],
+                settings.sun_color[1],
+                settings.sun_color[2],
+            );
+            light.shadow_maps_enabled = settings.sun && settings.shadows;
+        }
         let base = crate::app::sun_shadow_cascades(&config);
         let maximum =
             base.bounds.last().copied().unwrap_or(1000.0) * settings.shadow_distance_scale;
@@ -1083,7 +1089,9 @@ pub(crate) fn apply_render_settings(
         }
         .into();
     }
-    if let Some(ambient) = targets.ambient.as_deref_mut() {
+    if targets.scene_environment.is_none()
+        && let Some(ambient) = targets.ambient.as_deref_mut()
+    {
         ambient.brightness = settings.ambient_brightness;
         ambient.color = Color::srgb(
             settings.ambient_color[0],

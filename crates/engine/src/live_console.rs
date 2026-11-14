@@ -222,6 +222,8 @@ fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::V
         "tint_amount": grade.tint_amount, "tint_rgb": grade.tint_rgb,
         "tone_map": tone.mode.name(),
         "grading_source": tone.evidence_with_overrides(&source, mode, preset, overrides),
+        "environment_adapter": "bevy-interior-v1",
+        "environment": world.get_resource::<crate::world::environment::interior::SceneEnvironment>(),
         "pending_terrain_uploads": pending_terrain,
         "pending_specializations": pending_specializations,
         "pending_render_transfers": pending_transfers,

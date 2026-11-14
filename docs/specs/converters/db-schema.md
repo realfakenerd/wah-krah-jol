@@ -382,7 +382,7 @@ CREATE TABLE IF NOT EXISTS cell_regions (      -- XCLR, one row per region
 CREATE TABLE IF NOT EXISTS cell_lighting (     -- one row per CELL with an XCLL or an LTMP
     cell_id INTEGER PRIMARY KEY,
     lighting_template_id INTEGER,              -- LTMP -> LGTM
-    xcll_size INTEGER,                         -- 92, or 72 for the short form; NULL without XCLL
+    xcll_size INTEGER,                         -- authored byte length, even if rejected; NULL without XCLL
     ambient_r INTEGER, ambient_g INTEGER, ambient_b INTEGER,             -- XCLL[0..3]
     directional_r INTEGER, directional_g INTEGER, directional_b INTEGER, -- XCLL[4..7]
     fog_near_r INTEGER, fog_near_g INTEGER, fog_near_b INTEGER,          -- XCLL[8..11]
@@ -428,7 +428,10 @@ Rules:
 - Colours are 8-bit sRGB; each one's fourth byte is unused and not stored. The `dalc_*` columns
   are the cell's directional ambient lighting colours (what `LGTM` and `WTHR` keep in a `DALC`).
 - `XCLL` is 92 bytes in Skyrim SE. xEdit accepts it from 72 bytes, ending after the directional
-  ambient block; the fields past the end are then NULL. An `XCLL` under 72 bytes is ignored.
+  ambient block; the fields past the end are then NULL. An `XCLL` under 72 bytes has NULL lighting
+  fields but retains its authored `xcll_size`, including zero. It must not become an LTMP-only row.
+  Older conversions discarded this distinction; regenerate derived tables from source plugins to
+  recover it. Existing packs are not repaired in place.
   Floats that are not finite are NULL. `inherit_flags` says which fields the lighting template
   supplies instead: 0x1 ambient, 0x2 directional, 0x4 fog colour, 0x8 fog near, 0x10 fog far,
   0x20 directional rotation, 0x40 directional fade, 0x80 clip distance, 0x100 fog power,

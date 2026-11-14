@@ -220,6 +220,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     };
     // Authored lighting, weather, climate and image space, when the database has them (#269).
     // Read only; nothing renders from it yet.
+    // InteriorEnvironmentPlugin now consumes interior lighting below; exterior weather is deferred.
     let environment = runtime_data.as_ref().map(|_| {
         crate::world::environment::EnvironmentCatalog::open(
             &config.assets_dir.join("skyrim_world.db"),
@@ -415,7 +416,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     if let Some((database, catalog, cache, ground_height, spawn_ground_height)) = runtime_data {
         if let Some(environment) = environment {
-            app.insert_resource(environment);
+            app.insert_resource(environment)
+                .add_plugins(crate::world::environment::interior::InteriorEnvironmentPlugin);
         }
         if let Some(actor_catalog) = actor_catalog {
             app.insert_resource(actor_catalog);
@@ -2361,6 +2363,7 @@ fn setup_world(
             ..default()
         },
         sun_shadow_cascades(&config),
+        crate::world::environment::interior::WorldEnvironmentLight,
         RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(sun_rotation(&config)),
     ));

@@ -444,6 +444,7 @@ impl Plugin for SkyPlugin {
                 PostUpdate,
                 (spawn_sky_domes, follow_sky_cameras, apply_sky, apply_fog)
                     .chain()
+                    .after(crate::world::environment::interior::EnvironmentSet)
                     .before(TransformSystems::Propagate),
             );
     }
@@ -548,13 +549,21 @@ fn scaled_palette(
 fn apply_sky(
     palette: Res<SkyPalette>,
     space: Res<CameraSpace>,
+    environment: Option<Res<crate::world::environment::interior::SceneEnvironment>>,
     mut cameras: Query<&mut Camera, With<SkyCamera>>,
     mut domes: Query<(&MeshMaterial3d<SkyMaterial>, &mut Visibility), With<SkyDome>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
     settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
     let adjusted_palette = scaled_palette(&palette, settings.as_deref());
-    let clear = adjusted_palette.clear_colour(*space);
+    let sky_space = environment.as_ref().map_or(*space, |scene| {
+        if scene.show_sky {
+            CameraSpace::Exterior
+        } else {
+            CameraSpace::Interior
+        }
+    });
+    let clear = adjusted_palette.clear_colour(sky_space);
     for mut camera in &mut cameras {
         let current = match camera.clear_color {
             ClearColorConfig::Custom(colour) => Some(colour),
@@ -565,7 +574,7 @@ fn apply_sky(
         }
     }
     let visibility = match (
-        *space,
+        sky_space,
         settings.as_ref().is_none_or(|settings| settings.sky),
     ) {
         (CameraSpace::Exterior, true) => Visibility::Inherited,
@@ -940,6 +949,54 @@ mod tests {
         app.update();
         let (_, _, _, visibility) = only_dome(&mut app);
         assert_eq!(visibility, Visibility::Inherited);
+    }
+
+    #[test]
+    fn authored_show_sky_controls_the_actual_dome_independently_of_lighting_and_preferences() {
+        use crate::world::environment::interior::SceneEnvironment;
+        let mut app = sky_app();
+        *app.world_mut().resource_mut::<CameraSpace>() = CameraSpace::Interior;
+        app.insert_resource(SceneEnvironment::default())
+            .init_resource::<crate::settings::RenderingSettings>();
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), Transform::default(), SkyCamera))
+            .id();
+        for (show_sky, sky_lighting, user_sky) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            {
+                let mut environment = app.world_mut().resource_mut::<SceneEnvironment>();
+                environment.show_sky = show_sky;
+                environment.use_sky_lighting = sky_lighting;
+            }
+            app.world_mut()
+                .resource_mut::<crate::settings::RenderingSettings>()
+                .sky = user_sky;
+            app.update();
+            let (_, _, _, visibility) = only_dome(&mut app);
+            assert_eq!(
+                visibility,
+                if show_sky && user_sky {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                }
+            );
+            let expected = if show_sky {
+                SkyPalette::SKYRIM_CLEAR_DAY.clear_colour(CameraSpace::Exterior)
+            } else {
+                Color::BLACK
+            };
+            assert!(
+                matches!(app.world().get::<Camera>(camera).unwrap().clear_color,
+                ClearColorConfig::Custom(color) if color == expected)
+            );
+        }
     }
 
     #[test]
